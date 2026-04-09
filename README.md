@@ -59,7 +59,7 @@ This project was developed through AI-assisted ("vibecoded") collaboration — t
 
 MIT License
 
-Copyright (c) 2025 John Hertell
+Copyright (c) 2026 John Hertell
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

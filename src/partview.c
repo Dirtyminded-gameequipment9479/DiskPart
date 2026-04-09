@@ -1952,7 +1952,7 @@ static void show_about(struct Window *win)
         "\n"
         "https://github.com/ChuckyGang/DiskPart\n"
         "\n"
-        "MIT License \xa9 2025 John Hertell";
+        "MIT License \xa9 2026 John Hertell";
     es.es_GadgetFormat = (UBYTE *)"OK";
     EasyRequestArgs(win, &es, NULL, NULL);
 }
