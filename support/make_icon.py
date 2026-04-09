@@ -1,174 +1,156 @@
 #!/usr/bin/env python3
 """
-Generate DiskPart.info — a valid Amiga WBTool icon.
+Generate DiskPart.info — Amiga WBTool icon.
 
-Produces a 32x40, 2-bitplane icon with a simple hard-drive graphic.
-Run from the repo root:  python3 support/make_icon.py
-Output: DiskPart.info
+Converts hdicon.png (expected next to this script or at repo root)
+to a 36x40, 2-bitplane Amiga .info file.
+
+Colour mapping (Workbench 3.x default palette):
+  0 = grey  (Workbench background — used for transparent/outer area)
+  1 = black (dark pixels from source image)
+  2 = white (light pixels from source image)
+  3 = blue  (selection highlight — used for selected state background)
+
+Usage:  python3 support/make_icon.py
+Output: DiskPart.info  (repo root)
 """
 
 import struct, os, sys
+from PIL import Image
 
-# --- Image dimensions -------------------------------------------------
-W, H, DEPTH = 32, 40, 2
-WPL = (W + 15) // 16   # words per line = 2
+# --- Config -----------------------------------------------------------
+W, H   = 36, 40
+DEPTH  = 2
+WPL    = (W + 15) // 16   # words per line = 3
 
-# Colour indices (2-bitplane encoding):
-#   0 = 00 = screen background (Workbench grey)
-#   1 = 01 = colour 1 (black)
-#   2 = 10 = colour 2 (white / light)
-#   3 = 11 = colour 3 (Workbench blue highlight)
-
-def make_icon_grid():
-    g = [[0] * W for _ in range(H)]
-
-    def hline(y, x0, x1, c):
-        for x in range(x0, x1):
-            g[y][x] = c
-
-    def vline(x, y0, y1, c):
-        for y in range(y0, y1):
-            g[y][x] = c
-
-    def rect(y0, x0, y1, x1, c):
-        hline(y0, x0, x1, c)
-        hline(y1, x0, x1, c)
-        vline(x0, y0, y1 + 1, c)
-        vline(x1 - 1, y0, y1 + 1, c)
-
-    # Outer case border
-    rect(1, 0, H - 2, W, 1)
-
-    # Fill body with light colour
-    for y in range(2, H - 2):
-        hline(y, 1, W - 1, 2)
-
-    # Top cap: narrow strip across the top
-    for y in range(2, 6):
-        hline(y, 1, W - 1, 2)
-    hline(6, 1, W - 1, 1)
-
-    # Activity LED (top-right corner of cap)
-    for y in range(3, 6):
-        for x in range(W - 6, W - 3):
-            g[y][x] = 3
-
-    # Model label area (top-left of cap, lighter block)
-    for y in range(3, 6):
-        for x in range(2, 12):
-            g[y][x] = 2
-
-    # Platter tracks (horizontal stripes through body)
-    for track_y in range(10, H - 4, 5):
-        hline(track_y, 2, W - 2, 1)
-        hline(track_y + 1, 2, W - 2, 3)
-
-    # Read/write arm (diagonal-ish element)
-    for i in range(8):
-        x = 6 + i * 2
-        y = 16 + i
-        if 0 <= x < W and 0 <= y < H:
-            g[y][x] = 1
-        if 0 <= x + 1 < W:
-            g[y][x + 1] = 1
-
-    return g
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+SRC_PNG   = os.path.join(REPO_ROOT, 'support', 'hdicon.png')
+OUT_INFO  = os.path.join(REPO_ROOT, 'DiskPart.info')
 
 
-def invert_grid(g):
-    """Selected-state: swap colours 1 and 2, keep 0 and 3."""
+# --- Image conversion -------------------------------------------------
+
+def load_grid(path: str, w: int, h: int):
+    """Load PNG, resize to w×h, return 2-D list of colour indices 0-2."""
+    img = Image.open(path).convert('RGBA')
+    img = img.resize((w, h), Image.LANCZOS)
+
+    grid = []
+    for y in range(h):
+        row = []
+        for x in range(w):
+            r, g, b, a = img.getpixel((x, y))
+            # Treat fully-transparent as white background
+            if a < 128:
+                lum = 255
+            else:
+                lum = int(0.299 * r + 0.587 * g + 0.114 * b)
+            # Dark pixels → colour 1 (black), light pixels → colour 2 (white)
+            row.append(1 if lum < 128 else 2)
+        grid.append(row)
+    return grid
+
+
+def invert_grid(grid):
+    """Selected state: swap colours 1 and 2, leave 0 and 3 alone."""
     swap = {0: 0, 1: 2, 2: 1, 3: 3}
-    return [[swap[c] for c in row] for row in g]
+    return [[swap[c] for c in row] for row in grid]
 
 
-def grid_to_bitplanes(g):
-    """Encode grid as planar bitplane data (plane 0 all rows, then plane 1)."""
+def grid_to_bitplanes(grid) -> bytes:
+    """Encode as planar data: all rows of plane-0, then all rows of plane-1."""
     p0 = bytearray()
     p1 = bytearray()
-    for row in g:
+    for row in grid:
         for w in range(WPL):
             b0 = b1 = 0
             for bit in range(16):
                 px = w * 16 + bit
                 if px < W:
                     c = row[px]
-                    if c & 1:
-                        b0 |= 0x8000 >> bit
-                    if c & 2:
-                        b1 |= 0x8000 >> bit
+                    if c & 1: b0 |= 0x8000 >> bit
+                    if c & 2: b1 |= 0x8000 >> bit
             p0 += struct.pack('>H', b0)
             p1 += struct.pack('>H', b1)
     return bytes(p0) + bytes(p1)
 
 
-def pack_image_struct(w, h, depth, has_data, has_next):
-    """Return a packed Image struct (20 bytes)."""
+# --- Amiga struct helpers ---------------------------------------------
+
+def pack_image_struct(w, h, depth, has_data, has_next) -> bytes:
+    """Image struct — 20 bytes."""
     return struct.pack('>hhhhhIBBI',
-        0,                      # LeftEdge
-        0,                      # TopEdge
-        w,                      # Width
-        h,                      # Height
-        depth,                  # Depth
-        1 if has_data else 0,   # ImageData (non-NULL = data follows)
-        (1 << depth) - 1,       # PlanePick (all planes)
-        0,                      # PlaneOnOff
-        1 if has_next else 0,   # NextImage (non-NULL = another Image follows)
+        0, 0, w, h, depth,
+        1 if has_data else 0,
+        (1 << depth) - 1,   # PlanePick
+        0,                   # PlaneOnOff
+        1 if has_next else 0,
     )
 
 
-def pack_gadget_struct(w, h, has_default, has_select):
-    """Return a packed Gadget struct (44 bytes)."""
+def pack_gadget_struct(w, h) -> bytes:
+    """Gadget struct — 44 bytes."""
     return struct.pack('>IhhHHHHHIIIIIHI',
-        0,                              # NextGadget
-        0, 0,                           # LeftEdge, TopEdge
-        w, h,                           # Width, Height
-        0x0006,                         # Flags: GADGIMAGE | GADGHIMAGE
-        0x0000,                         # Activation
-        0x0001,                         # GadgetType: GTYP_BOOLGADGET
-        1 if has_default else 0,        # GadgetRender
-        1 if has_select else 0,         # SelectRender
-        0, 0, 0,                        # GadgetText, MutualExclude, SpecialInfo
-        0, 0,                           # GadgetID, UserData
+        0,          # NextGadget
+        0, 0,       # LeftEdge, TopEdge
+        w, h,       # Width, Height
+        0x0006,     # Flags: GADGIMAGE | GADGHIMAGE
+        0x0000,     # Activation
+        0x0001,     # GadgetType: GTYP_BOOLGADGET
+        1,          # GadgetRender (non-NULL → image follows)
+        1,          # SelectRender (non-NULL → selected image follows)
+        0, 0, 0,    # GadgetText, MutualExclude, SpecialInfo
+        0, 0,       # GadgetID, UserData
     )
 
 
-# --- Assemble the .info file ------------------------------------------
+# --- Build .info file -------------------------------------------------
 
-default_grid = make_icon_grid()
-select_grid  = invert_grid(default_grid)
-default_data = grid_to_bitplanes(default_grid)
-select_data  = grid_to_bitplanes(select_grid)
+def build_info(default_grid, select_grid) -> bytes:
+    default_data = grid_to_bitplanes(default_grid)
+    select_data  = grid_to_bitplanes(select_grid)
 
-out = bytearray()
+    out = bytearray()
 
-# DiskObject (78 bytes total)
-out += struct.pack('>HH', 0xE310, 1)            # Magic, Version
-out += pack_gadget_struct(W, H, True, True)      # Gadget (44 bytes)
-out += bytes([3, 0])                             # do_Type=WBTOOL + 1 pad byte
-out += struct.pack('>IIIIII',
-    0,           # do_DefaultTool  (NULL)
-    0,           # do_ToolTypes    (NULL)
-    0x80000000,  # do_CurrentX     (NO_ICON_POSITION)
-    0x80000000,  # do_CurrentY     (NO_ICON_POSITION)
-    0,           # do_DrawerData   (NULL)
-    0,           # do_ToolWindow   (NULL)
-)
-out += struct.pack('>I', 8192)                   # do_StackSize
+    # DiskObject header (78 bytes)
+    out += struct.pack('>HH', 0xE310, 1)    # Magic, Version
+    out += pack_gadget_struct(W, H)          # Gadget (44 bytes)
+    out += bytes([3, 0])                     # do_Type=WBTOOL + 1 pad byte
+    out += struct.pack('>IIIIII',
+        0,           # do_DefaultTool  (NULL)
+        0,           # do_ToolTypes    (NULL)
+        0x80000000,  # do_CurrentX     (NO_ICON_POSITION)
+        0x80000000,  # do_CurrentY     (NO_ICON_POSITION)
+        0,           # do_DrawerData   (NULL)
+        0,           # do_ToolWindow   (NULL)
+    )
+    out += struct.pack('>I', 8192)           # do_StackSize
+    assert len(out) == 78
 
-assert len(out) == 78, f"DiskObject size wrong: {len(out)}"
+    # Default image
+    out += pack_image_struct(W, H, DEPTH, has_data=True, has_next=False)
+    out += default_data
 
-# Default image
-out += pack_image_struct(W, H, DEPTH, has_data=True, has_next=False)
-out += default_data
+    # Selected image (colours 1 and 2 swapped)
+    out += pack_image_struct(W, H, DEPTH, has_data=True, has_next=False)
+    out += select_data
 
-# Selected image
-out += pack_image_struct(W, H, DEPTH, has_data=True, has_next=False)
-out += select_data
+    return bytes(out)
 
-# Write
-dest = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                    'DiskPart.info')
-with open(dest, 'wb') as f:
-    f.write(out)
 
-print(f"Written {dest} ({len(out)} bytes)")
+# --- Main -------------------------------------------------------------
+
+if __name__ == '__main__':
+    src = SRC_PNG
+    if not os.path.exists(src):
+        print(f"Source PNG not found: {src}", file=sys.stderr)
+        sys.exit(1)
+
+    default_grid = load_grid(src, W, H)
+    select_grid  = invert_grid(default_grid)
+    data         = build_info(default_grid, select_grid)
+
+    with open(OUT_INFO, 'wb') as f:
+        f.write(data)
+
+    print(f"Written {OUT_INFO} ({len(data)} bytes, {W}x{H} px, {DEPTH} planes)")

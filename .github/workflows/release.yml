@@ -19,7 +19,9 @@ jobs:
         run: echo "DATE=$(date -u +%Y%m%d)" >> "$GITHUB_OUTPUT"
 
       - name: Regenerate icon
-        run: python3 support/make_icon.py
+        run: |
+          pip install pillow -q
+          python3 support/make_icon.py
 
       - name: Create LHA archive
         run: |
