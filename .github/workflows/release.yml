@@ -27,9 +27,9 @@ jobs:
         run: |
           ARCHIVE="DiskPart-${{ steps.date.outputs.DATE }}-PROTO.lha"
           python3 support/make_lha.py "$ARCHIVE" \
-            "DiskPart/DiskPart.exe:out/DiskPart.exe" \
-            "DiskPart/DiskPart.info:DiskPart.info" \
-            "DiskPart/README.md:README.md"
+            "DiskPart:out/DiskPart.exe" \
+            "DiskPart.info:DiskPart.info" \
+            "README.md:README.md"
           ls -lh "$ARCHIVE"
 
       - name: Delete previous PROTO release (if any)
