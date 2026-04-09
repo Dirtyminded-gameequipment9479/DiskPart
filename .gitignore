@@ -1,0 +1,6 @@
+obj/
+out/*.elf
+out/*.map
+out/*.s
+out/T
+out/T.uaem
