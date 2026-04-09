@@ -88,7 +88,7 @@ static const UBYTE PART_B[NUM_PART_COLORS]={0xD9,0x22,0x60,0xAD,0x3C,0x85,0x12,0
 
 /* Column header drawn just above the listview gadget */
 static const char PART_HDR[] =
-    "  Drive   Lo Cyl Hi Cyl  Filesystem       Size  Boot";
+    "  Drive   Lo Cyl Hi Cyl  FileSystem       Size  Boot";
 
 static char        part_strs[MAX_PARTITIONS][80];
 static struct Node part_nodes[MAX_PARTITIONS];
@@ -1120,7 +1120,7 @@ static BOOL partition_dialog(struct PartInfo *pi, const char *title,
             /* Filesystem (cycle) */
             ng.ng_LeftEdge=gad_x; ng.ng_TopEdge=ROW_Y(row);
             ng.ng_Width=gad_w; ng.ng_Height=row_h;
-            ng.ng_GadgetText="Filesystem"; ng.ng_GadgetID=PDLG_TYPE;
+            ng.ng_GadgetText="FileSystem"; ng.ng_GadgetID=PDLG_TYPE;
             ng.ng_Flags=PLACETEXT_LEFT;
             { struct TagItem ct[]={{GTCY_Labels,(ULONG)dlg_fs_labels},
                                    {GTCY_Active,(ULONG)cur_fs},{TAG_DONE,0}};
@@ -1478,7 +1478,7 @@ static BOOL fs_addedit_dialog(struct FSInfo *fi, BOOL is_edit)
               {WA_Left,(ULONG)((scr->Width-win_w)/2)},
               {WA_Top,(ULONG)((scr->Height-win_h)/2)},
               {WA_Width,win_w},{WA_Height,win_h},
-              {WA_Title,(ULONG)(is_edit ? "Edit Filesystem Driver" : "Add Filesystem Driver")},
+              {WA_Title,(ULONG)(is_edit ? "Edit FileSystem Driver" : "Add FileSystem Driver")},
               {WA_Gadgets,(ULONG)glist},{WA_PubScreen,(ULONG)scr},
               {WA_IDCMP,IDCMP_CLOSEWINDOW|IDCMP_GADGETUP|IDCMP_REFRESHWINDOW},
               {WA_Flags,WFLG_DRAGBAR|WFLG_DEPTHGADGET|WFLG_CLOSEGADGET|
@@ -1512,7 +1512,7 @@ static BOOL fs_addedit_dialog(struct FSInfo *fi, BOOL is_edit)
                             struct FileRequester *fr;
                             struct StringInfo *si = (struct StringInfo *)file_gad->SpecialInfo;
                             { struct TagItem asl_tags[] = {
-                                  { ASLFR_TitleText,    (ULONG)"Select Filesystem Driver" },
+                                  { ASLFR_TitleText,    (ULONG)"Select FileSystem Driver" },
                                   { ASLFR_InitialDrawer,(ULONG)"L:" },
                                   { ASLFR_InitialFile,  (ULONG)si->Buffer },
                                   { TAG_DONE, 0 } };
@@ -1637,7 +1637,7 @@ static BOOL filesystem_manager_dialog(struct RDBInfo *rdb)
               {WA_Left,(ULONG)((scr->Width-win_w)/2)},
               {WA_Top,(ULONG)((scr->Height-win_h)/2)},
               {WA_Width,win_w},{WA_Height,win_h},
-              {WA_Title,(ULONG)"Filesystem Drivers"},
+              {WA_Title,(ULONG)"FileSystem Drivers"},
               {WA_Gadgets,(ULONG)glist},{WA_PubScreen,(ULONG)scr},
               {WA_IDCMP,IDCMP_CLOSEWINDOW|IDCMP_GADGETUP|
                         IDCMP_GADGETDOWN|IDCMP_REFRESHWINDOW},
@@ -1920,7 +1920,7 @@ static BOOL build_gadgets(APTR vi,
     MKBTN(bor_l+pad+(seventh+pad)*1,      "Add",      GID_ADD)
     MKBTN(bor_l+pad+(seventh+pad)*2,      "Edit",     GID_EDIT)
     MKBTN(bor_l+pad+(seventh+pad)*3,      "Delete",   GID_DELETE)
-    MKBTN(bor_l+pad+(seventh+pad)*4,      "Filesys",  GID_FILESYS)
+    MKBTN(bor_l+pad+(seventh+pad)*4,      "FileSys",  GID_FILESYS)
     MKBTN(bor_l+pad+(seventh+pad)*5,      "Write",    GID_WRITE)
     MKBTN(bor_l+pad+(seventh+pad)*6,      "Back",     GID_BACK)
 #undef MKBTN
