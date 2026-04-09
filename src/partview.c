@@ -1934,6 +1934,35 @@ static BOOL build_gadgets(APTR vi,
 /* partview_run                                                         */
 /* ------------------------------------------------------------------ */
 
+static void show_about(struct Window *win)
+{
+    struct EasyStruct es;
+    es.es_StructSize   = sizeof(es);
+    es.es_Flags        = 0;
+    es.es_Title        = (UBYTE *)"About DiskPart";
+    es.es_TextFormat   = (UBYTE *)
+        "DiskPart\n"
+        "AmigaOS 3.x RDB Hard Disk Partition Editor\n"
+        "\n"
+        "A native GadTools application with full RDB support.\n"
+        "No external library dependencies beyond the ROM.\n"
+        "\n"
+        "Director: John Hertell\n"
+        "Code: Claude Code (Anthropic)\n"
+        "\n"
+        "https://github.com/ChuckyGang/DiskPart\n"
+        "\n"
+        "MIT License \xa9 2025 John Hertell";
+    es.es_GadgetFormat = (UBYTE *)"OK";
+    EasyRequestArgs(win, &es, NULL, NULL);
+}
+
+static struct NewMenu partview_menu_def[] = {
+    { NM_TITLE, "DiskPart", NULL, 0, 0, NULL },
+    { NM_ITEM,  "About...", NULL, 0, 0, NULL },
+    { NM_END,   NULL,       NULL, 0, 0, NULL },
+};
+
 BOOL partview_run(const char *devname, ULONG unit)
 {
     struct BlockDev  *bd       = NULL;
@@ -1943,6 +1972,7 @@ BOOL partview_run(const char *devname, ULONG unit)
     struct Gadget    *glist    = NULL;
     struct Gadget    *lv_gad   = NULL;
     struct Window    *win      = NULL;
+    struct Menu      *menu     = NULL;
     WORD              sel      = -1;
     BOOL              dirty    = FALSE;   /* unsaved changes pending */
     BOOL              exit_req = FALSE;
@@ -2055,7 +2085,7 @@ BOOL partview_run(const char *devname, ULONG unit)
                 { WA_IDCMP,     IDCMP_CLOSEWINDOW | IDCMP_GADGETUP |
                                 IDCMP_GADGETDOWN  | IDCMP_REFRESHWINDOW |
                                 IDCMP_MOUSEBUTTONS | IDCMP_MOUSEMOVE |
-                                IDCMP_NEWSIZE },
+                                IDCMP_NEWSIZE | IDCMP_MENUPICK },
                 { WA_Flags,     WFLG_DRAGBAR | WFLG_DEPTHGADGET |
                                 WFLG_CLOSEGADGET | WFLG_ACTIVATE |
                                 WFLG_SIMPLE_REFRESH | WFLG_REPORTMOUSE |
@@ -2111,6 +2141,15 @@ BOOL partview_run(const char *devname, ULONG unit)
         }
     }
 
+    {
+        struct TagItem lt[] = { { TAG_DONE, 0 } };
+        menu = CreateMenusA(partview_menu_def, NULL);
+        if (menu) {
+            LayoutMenusA(menu, vi, lt);
+            SetMenuStrip(win, menu);
+        }
+    }
+
     GT_RefreshWindow(win, NULL);
     draw_static(win, devname, unit, rdb,
                 ix, iy, iw, bx, by, bw, bh, hx, hy, hw, sel);
@@ -2132,6 +2171,18 @@ BOOL partview_run(const char *devname, ULONG unit)
                 GT_ReplyIMsg(imsg);
 
                 switch (iclass) {
+
+                case IDCMP_MENUPICK: {
+                    UWORD mcode = code;
+                    while (mcode != MENUNULL) {
+                        struct MenuItem *it = ItemAddress(menu, mcode);
+                        if (!it) break;
+                        if (MENUNUM(mcode) == 0 && ITEMNUM(mcode) == 0)
+                            show_about(win);
+                        mcode = it->NextSelect;
+                    }
+                    break;
+                }
 
                 case IDCMP_CLOSEWINDOW: {
                     struct EasyStruct es;
@@ -2668,7 +2719,8 @@ BOOL partview_run(const char *devname, ULONG unit)
     }
 
 cleanup:
-    if (win)   { if (glist) RemoveGList(win, glist, -1); CloseWindow(win); }
+    if (win)   { ClearMenuStrip(win); if (glist) RemoveGList(win, glist, -1); CloseWindow(win); }
+    if (menu)    FreeMenus(menu);
     if (glist)   FreeGadgets(glist);
     if (vi)      FreeVisualInfo(vi);
     if (scr)     UnlockPubScreen(NULL, scr);

@@ -122,11 +122,17 @@ __attribute__((used)) __attribute__((section(".text.unlikely"))) void _start() {
 	unsigned long count;
 	unsigned long i;
 
+	/* SysBase must be set before any Exec call.  main() also sets it, but
+	   we need it here before main() runs. */
+	SysBase = *((struct ExecBase **)4UL);
+
 	/* Detect Workbench launch: no CLI segment means WBStartup message is
 	   waiting on pr_MsgPort.  Receive it now; we must reply before exit. */
 	proc = (struct Process *)FindTask(NULL);
 	if (proc->pr_CLI == 0) {
-		WaitPort(&proc->pr_MsgPort);
+		/* In a real WB launch the message is already queued before _start()
+		   runs, so GetMsg is sufficient — no need to block with WaitPort.
+		   If NULL (e.g. Bartman debug launcher), skip WB reply gracefully. */
 		wb_msg = GetMsg(&proc->pr_MsgPort);
 	}
 
