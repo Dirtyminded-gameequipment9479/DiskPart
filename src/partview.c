@@ -802,6 +802,7 @@ static ULONG parse_dostype(const char *s)
 #define PDLG_OK          8
 #define PDLG_ADVANCED    9
 #define PDLG_CANCEL      10
+#define PDLG_SYNCSCSI    11
 
 /* Rows: Name, LoCyl, HiCyl, FS, BootPri, Bootable+DirSCSI */
 #define PDLG_ROWS 6
@@ -988,6 +989,7 @@ static BOOL partition_dialog(struct PartInfo *pi, const char *title,
     struct Gadget  *bootpri_gad  = NULL;
     struct Gadget  *boot_gad     = NULL;
     struct Gadget  *dirscsi_gad  = NULL;
+    struct Gadget  *syncscsi_gad = NULL;
     struct Window  *win          = NULL;
     BOOL            result       = FALSE;
     UWORD           cur_fs       = 1;   /* default FFS */
@@ -1130,28 +1132,37 @@ static BOOL partition_dialog(struct PartInfo *pi, const char *title,
 
             STR_GAD(PDLG_BOOTPRI, "Boot Priority", bootpri_str, 8, &bootpri_gad)
 
-            /* Bootable [x]   Direct SCSI [x] */
+            /* Bootable [x]   Direct SCSI [x]   Sync SCSI [x] */
             {
                 BOOL is_bootable = (BOOL)((pi->flags & 2) == 0);
                 BOOL is_dirscsi  = (BOOL)((pi->flags & 4) != 0);
-                UWORD half = (inner_w - pad * 3) / 2;
+                BOOL is_syncscsi = (BOOL)((pi->flags & 8) != 0);
+                UWORD third = (inner_w - pad * 4) / 3;
                 struct TagItem cbt[] = { { GTCB_Checked, 0 }, { TAG_DONE, 0 } };
 
                 cbt[0].ti_Data = (ULONG)is_bootable;
                 ng.ng_LeftEdge=bor_l+pad; ng.ng_TopEdge=ROW_Y(row);
-                ng.ng_Width=half; ng.ng_Height=row_h;
+                ng.ng_Width=third; ng.ng_Height=row_h;
                 ng.ng_GadgetText="Bootable"; ng.ng_GadgetID=PDLG_BOOTABLE;
                 ng.ng_Flags=PLACETEXT_RIGHT;
                 boot_gad=CreateGadgetA(CHECKBOX_KIND,prev,&ng,cbt);
                 if (!boot_gad) goto cleanup; prev=boot_gad;
 
                 cbt[0].ti_Data=(ULONG)is_dirscsi;
-                ng.ng_LeftEdge=bor_l+pad+half+pad; ng.ng_TopEdge=ROW_Y(row);
-                ng.ng_Width=half; ng.ng_Height=row_h;
+                ng.ng_LeftEdge=bor_l+pad+third+pad; ng.ng_TopEdge=ROW_Y(row);
+                ng.ng_Width=third; ng.ng_Height=row_h;
                 ng.ng_GadgetText="Direct SCSI"; ng.ng_GadgetID=PDLG_DIRSCSI;
                 ng.ng_Flags=PLACETEXT_RIGHT;
                 dirscsi_gad=CreateGadgetA(CHECKBOX_KIND,prev,&ng,cbt);
                 if (!dirscsi_gad) goto cleanup; prev=dirscsi_gad;
+
+                cbt[0].ti_Data=(ULONG)is_syncscsi;
+                ng.ng_LeftEdge=bor_l+pad+(third+pad)*2; ng.ng_TopEdge=ROW_Y(row);
+                ng.ng_Width=third; ng.ng_Height=row_h;
+                ng.ng_GadgetText="Sync SCSI"; ng.ng_GadgetID=PDLG_SYNCSCSI;
+                ng.ng_Flags=PLACETEXT_RIGHT;
+                syncscsi_gad=CreateGadgetA(CHECKBOX_KIND,prev,&ng,cbt);
+                if (!syncscsi_gad) goto cleanup; prev=syncscsi_gad;
             }
             row++;
 
@@ -1250,8 +1261,9 @@ static BOOL partition_dialog(struct PartInfo *pi, const char *title,
                         si = (struct StringInfo *)bootpri_gad->SpecialInfo;
                         pi->boot_pri = parse_long((char *)si->Buffer);
                         pi->flags = 0;
-                        if (!(boot_gad->Flags    & GFLG_SELECTED)) pi->flags |= 2UL;
+                        if (!(boot_gad->Flags     & GFLG_SELECTED)) pi->flags |= 2UL;
                         if (  dirscsi_gad->Flags  & GFLG_SELECTED)  pi->flags |= 4UL;
+                        if (  syncscsi_gad->Flags & GFLG_SELECTED)  pi->flags |= 8UL;
                         pi->dos_type = dlg_fs_dostypes[cur_fs];
                         result = TRUE; running = FALSE; break;
                     }
