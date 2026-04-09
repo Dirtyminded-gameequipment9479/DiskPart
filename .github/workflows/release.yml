@@ -18,24 +18,17 @@ jobs:
         id: date
         run: echo "DATE=$(date -u +%Y%m%d)" >> "$GITHUB_OUTPUT"
 
-      - name: Install lhasa
-        run: sudo apt-get update -qq && sudo apt-get install -y lhasa
-
       - name: Regenerate icon
         run: python3 support/make_icon.py
 
-      - name: Assemble archive contents
-        run: |
-          mkdir -p dist/DiskPart
-          cp out/DiskPart.exe  dist/DiskPart/DiskPart.exe
-          cp DiskPart.info     dist/DiskPart/DiskPart.info
-          cp README.md         dist/DiskPart/README.md
-
       - name: Create LHA archive
         run: |
-          cd dist
-          lhasa c "DiskPart-${{ steps.date.outputs.DATE }}-PROTO.lha" DiskPart/
-          ls -lh *.lha
+          ARCHIVE="DiskPart-${{ steps.date.outputs.DATE }}-PROTO.lha"
+          python3 support/make_lha.py "$ARCHIVE" \
+            "DiskPart/DiskPart.exe:out/DiskPart.exe" \
+            "DiskPart/DiskPart.info:DiskPart.info" \
+            "DiskPart/README.md:README.md"
+          ls -lh "$ARCHIVE"
 
       - name: Delete previous PROTO release (if any)
         env:
@@ -52,4 +45,4 @@ jobs:
             --title "DiskPart ${{ steps.date.outputs.DATE }} PROTO" \
             --notes "Automated prototype build from commit \`${{ github.sha }}\`." \
             --prerelease \
-            "dist/DiskPart-${{ steps.date.outputs.DATE }}-PROTO.lha"
+            "DiskPart-${{ steps.date.outputs.DATE }}-PROTO.lha"
