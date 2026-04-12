@@ -106,9 +106,15 @@ struct BlockDev *BlockDev_Open(const char *devname, ULONG unit)
     /* ignore error — geometry is informational only */
 
     bd->block_size  = 512;   /* RDB format requires 512-byte blocks */
-    bd->total_bytes = (geom.dg_TotalSectors > 0)
-                      ? (UQUAD)geom.dg_TotalSectors * 512UL
-                      : 0;
+    {
+        /* Use the reported sector size for capacity math so large-sector
+           devices (4K native, etc.) display the correct total size.
+           Fall back to 512 if the driver returns 0 or a nonsense value. */
+        ULONG sec_sz = (geom.dg_SectorSize >= 512) ? geom.dg_SectorSize : 512;
+        bd->total_bytes = (geom.dg_TotalSectors > 0)
+                          ? (UQUAD)geom.dg_TotalSectors * sec_sz
+                          : 0;
+    }
 
     /* SCSI INQUIRY to get vendor/product for display (best effort) */
     {
@@ -182,9 +188,6 @@ void BlockDev_Close(struct BlockDev *bd)
 BOOL BlockDev_ReadBlock(struct BlockDev *bd, ULONG blocknum, void *buf)
 {
     /* Try HD_SCSICMD (SCSI READ(10)) first.
-       On A3000 scsi.device, CMD_READ has DMA timing issues with certain
-       SD card adapters causing consistent read corruption, while the
-       HD_SCSICMD path works correctly (confirmed by hex dump csum=OK).
        Falls back to CMD_READ for devices that don't support HD_SCSICMD
        (e.g. UAE uaehf.device, older non-SCSI drivers). */
     {
@@ -433,11 +436,21 @@ BOOL RDB_Read(struct BlockDev *bd, struct RDBInfo *rdb)
         UBYTE  len;
         struct PartInfo *pi;
 
+        if (next == 0 || next == rdb->block_num) break;  /* sanity: skip MBR/RDSK blocks */
         if (!BlockDev_ReadBlock(bd, next, buf))
             break;
         pb = (struct PartitionBlock *)buf;
         if (pb->pb_ID != IDNAME_PARTITION)
             break;
+        /* Checksum-validate the PART block the same way we do RDSK */
+        {
+            const ULONG *lp = (const ULONG *)buf;
+            ULONG sum = 0, sl, ci;
+            sl = pb->pb_SummedLongs;
+            if (sl == 0 || sl > 128) sl = 128;
+            for (ci = 0; ci < sl; ci++) sum += lp[ci];
+            if (sum != 0) break;   /* checksum mismatch — corrupt or truncated chain */
+        }
 
         pi = &rdb->parts[rdb->num_parts];
         pi->block_num = next;
@@ -485,11 +498,21 @@ BOOL RDB_Read(struct BlockDev *bd, struct RDBInfo *rdb)
         ULONG lseg_blk;
         ULONG num_lseg;
 
+        if (next == 0 || next == rdb->block_num) break;  /* sanity: skip MBR/RDSK blocks */
         if (!BlockDev_ReadBlock(bd, next, buf))
             break;
         fhb = (struct FileSysHeaderBlock *)buf;
         if (fhb->fhb_ID != IDNAME_FSHEADER)
             break;
+        /* Checksum-validate the FSHD block */
+        {
+            const ULONG *lp = (const ULONG *)buf;
+            ULONG sum = 0, sl, ci;
+            sl = fhb->fhb_SummedLongs;
+            if (sl == 0 || sl > 128) sl = 128;
+            for (ci = 0; ci < sl; ci++) sum += lp[ci];
+            if (sum != 0) break;   /* checksum mismatch — corrupt or truncated chain */
+        }
 
         fi = &rdb->filesystems[rdb->num_fs];
         fi->block_num    = next;
@@ -514,9 +537,17 @@ BOOL RDB_Read(struct BlockDev *bd, struct RDBInfo *rdb)
         lseg_blk = fi->seg_list_blk;
         while (lseg_blk != RDB_END_MARK) {
             struct LoadSegBlock *lsb;
+            const ULONG *lp;
+            ULONG sum, sl, ci;
+            if (lseg_blk == 0) break;  /* sanity: block 0 is MBR */
             if (!BlockDev_ReadBlock(bd, lseg_blk, buf)) break;
             lsb = (struct LoadSegBlock *)buf;
             if (lsb->lsb_ID != IDNAME_LOADSEG) break;
+            lp = (const ULONG *)buf;
+            sl = lsb->lsb_SummedLongs;
+            if (sl == 0 || sl > 128) sl = 128;
+            sum = 0; for (ci = 0; ci < sl; ci++) sum += lp[ci];
+            if (sum != 0) break;   /* checksum mismatch */
             num_lseg++;
             lseg_blk = lsb->lsb_Next;
         }
@@ -530,10 +561,17 @@ BOOL RDB_Read(struct BlockDev *bd, struct RDBInfo *rdb)
                 lseg_blk = fi->seg_list_blk;
                 while (lseg_blk != RDB_END_MARK && offset < alloc_sz) {
                     struct LoadSegBlock *lsb;
-                    ULONG data_bytes;
+                    const ULONG *lp;
+                    ULONG data_bytes, sum, sl, ci;
+                    if (lseg_blk == 0) { ok = FALSE; break; }
                     if (!BlockDev_ReadBlock(bd, lseg_blk, buf)) { ok = FALSE; break; }
                     lsb = (struct LoadSegBlock *)buf;
                     if (lsb->lsb_ID != IDNAME_LOADSEG) { ok = FALSE; break; }
+                    lp = (const ULONG *)buf;
+                    sl = lsb->lsb_SummedLongs;
+                    if (sl == 0 || sl > 128) sl = 128;
+                    sum = 0; for (ci = 0; ci < sl; ci++) sum += lp[ci];
+                    if (sum != 0) { ok = FALSE; break; }
                     /* Respect lsb_SummedLongs — the last block may be partial.
                        SummedLongs includes 5 header longs; the rest is data.
                        Clamp to 492 bytes (123 longs) maximum per block. */
@@ -581,7 +619,7 @@ void RDB_ScanDiag(struct BlockDev *bd, char *out)
         /* rdb_Cylinders @+64, rdb_Sectors @+68, rdb_Heads @+72 (longs 16,17,18) */
         const ULONG *lp = (const ULONG *)buf;
         sprintf(p, "RDB: cyls=%lu heads=%lu secs=%lu\n",
-                lp[16], lp[17], lp[18]);
+                lp[16], lp[18], lp[17]);
     } else {
         sprintf(p, "RDB: read error\n");
     }
@@ -663,7 +701,7 @@ void RDB_InitFresh(struct RDBInfo *rdb,
     rdb->hi_cyl       = cylinders - 1;
     rdb->part_list    = RDB_END_MARK;
     rdb->fshdr_list   = RDB_END_MARK;
-    rdb->flags        = 0x07UL;  /* RDBFF_LAST|RDBFF_LASTLUN|RDBFF_LASTTID */
+    rdb->flags        = RDBFF_LASTTID;  /* LAST/LASTLUN unchecked by default; user-controlled */
     rdb->num_parts    = 0;
     rdb->num_fs       = 0;
 }
@@ -758,10 +796,8 @@ BOOL RDB_Write(struct BlockDev *bd, struct RDBInfo *rdb)
         last_used_blk = rdb->rdb_block_lo;
 
     /* Single contiguous buffer — all blocks filled in-memory first, then
-       written one block at a time.  Allocate 4 extra bytes at the end so
-       that BlockDev_WriteBlock can safely pass (buf+4) as io_Data — the
-       A3000 SDMAC workaround reads from buf[0..511] via io_Data-4. */
-    big_buf = (UBYTE *)AllocVec(total_blocks * bd->block_size + 4, MEMF_PUBLIC | MEMF_CLEAR);
+       written one block at a time. */
+    big_buf = (UBYTE *)AllocVec(total_blocks * bd->block_size, MEMF_PUBLIC | MEMF_CLEAR);
     if (!big_buf) return FALSE;
 
 /* pointer into big_buf for an absolute block number */
@@ -878,7 +914,13 @@ BOOL RDB_Write(struct BlockDev *bd, struct RDBInfo *rdb)
     }
 
     /* --- Fill RigidDiskBlock (last: needs part_list / fshdr_list) --- */
-    buf  = BLKPTR(rdb->block_num);
+    /* Always write RDSK at rdb_block_lo (layout slot 0).  block_num records
+       where the header was *found* on read, which may differ from rdb_block_lo
+       on disks written by other tools.  BLKPTR() is offset from rdb_block_lo,
+       so using block_num here would produce an out-of-bounds write if they
+       differ.  Normalize block_num so post-write reads land in the right place. */
+    rdb->block_num = rdb->rdb_block_lo;
+    buf  = BLKPTR(rdb->rdb_block_lo);
     rdsk = (struct RigidDiskBlock *)buf;
 
     rdsk->rdb_ID          = IDNAME_RIGIDDISK;
@@ -886,7 +928,7 @@ BOOL RDB_Write(struct BlockDev *bd, struct RDBInfo *rdb)
     rdsk->rdb_ChkSum      = 0;
     rdsk->rdb_HostID      = 7;
     rdsk->rdb_BlockBytes  = bd->block_size;
-    rdsk->rdb_Flags       = rdb->flags | 0x07UL; /* always set RDBFF_LAST|RDBFF_LASTLUN|RDBFF_LASTTID */
+    rdsk->rdb_Flags       = rdb->flags | RDBFF_LASTTID; /* RDBFF_LAST/LASTLUN user-controlled; LASTTID always set */
 
     /* Optional block list heads: 0xFFFFFFFF = none */
     rdsk->rdb_BadBlockList      = RDB_END_MARK;

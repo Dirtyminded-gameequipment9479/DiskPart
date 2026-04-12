@@ -42,6 +42,7 @@
 #include "clib.h"
 #include "rdb.h"
 #include "partview.h"
+#include "version.h"
 
 /* ------------------------------------------------------------------ */
 /* External library bases (defined in main.c)                          */
@@ -79,6 +80,8 @@ extern struct Library       *GadToolsBase;
 #define GID_FILESYS   6
 #define GID_WRITE     7
 #define GID_BACK      8
+#define GID_LASTDISK  9
+#define GID_LASTLUN   10
 
 /* ------------------------------------------------------------------ */
 /* Partition colours — match AmigaPart COLORS list                     */
@@ -517,83 +520,92 @@ static void draw_info(struct Window *win, const char *devname, ULONG unit,
                       WORD ix, WORD iy, UWORD iw)
 {
     struct RastPort *rp = win->RPort;
-    char   line1[120], line2[120];
+    char   line1[120], line2[120], line3[120];
     char   sz[16];
     WORD   fb  = rp->TxBaseline;
     WORD   fh  = rp->TxHeight;
     WORD   txw = rp->TxWidth ? (WORD)rp->TxWidth : 8;
+    /* Checkbox gadgets occupy the right side of line 3 — leave a gap there.
+       Width formula must match the cbw in build_gadgets. */
+    UWORD  cbw       = (UWORD)((UWORD)fh * 2 + 82);
+    UWORD  cb_res    = (UWORD)(cbw * 2 + 16);  /* 2 checkboxes + gap + small margin */
 
-    /* Erase the info area */
+    /* Erase the full info area (checkboxes on line 3 are redrawn by draw_static) */
     SetAPen(rp, 0);
     SetDrMd(rp, JAM2);
-    RectFill(rp, ix, iy, ix+(WORD)iw-1, iy+fh*2+4);
+    RectFill(rp, ix, iy, ix+(WORD)iw-1, iy+(WORD)fh*3+8);
 
     SetAPen(rp, 1);
     SetDrMd(rp, JAM1);
 
-    if (rdb && rdb->cylinders > 0) {
-        UQUAD total = (UQUAD)rdb->cylinders * rdb->heads * rdb->sectors * 512;
-        FormatSize(total, sz);
-        sprintf(line1, "Device: %s/%lu    Size: %s    Geometry: %lu x %lu x %lu",
-                devname, (unsigned long)unit, sz,
+    /* Line 1: device / size / model */
+    {
+        char model[36];
+        model[0] = '\0';
+        if (brand && brand[0])
+            strncpy(model, brand, 35);
+        else if (rdb && (rdb->disk_vendor[0] || rdb->disk_product[0]))
+            sprintf(model, "%s %s", rdb->disk_vendor, rdb->disk_product);
+        model[35] = '\0';
+
+        if (rdb && rdb->cylinders > 0) {
+            FormatSize((UQUAD)rdb->cylinders * rdb->heads * rdb->sectors * 512, sz);
+        } else {
+            strncpy(sz, "unknown", 15); sz[15] = '\0';
+        }
+
+        if (model[0])
+            sprintf(line1, "Device: %s/%lu    Size: %s    Model: %s",
+                    devname, (unsigned long)unit, sz, model);
+        else
+            sprintf(line1, "Device: %s/%lu    Size: %s",
+                    devname, (unsigned long)unit, sz);
+    }
+
+    /* Line 2: full geometry so large cylinder counts never clip */
+    if (rdb && rdb->cylinders > 0)
+        sprintf(line2, "Geometry: %lu x %lu x %lu  (CYL x HD x SEC)",
                 (unsigned long)rdb->cylinders,
                 (unsigned long)rdb->heads,
                 (unsigned long)rdb->sectors);
-    } else {
-        sprintf(line1, "Device: %s/%lu    Size: unknown    Geometry: unknown",
-                devname, (unsigned long)unit);
-    }
+    else
+        strncpy(line2, "Geometry: unknown", 119);
 
+    /* Line 3: RDB partition / free info (text clipped short; right side
+       is occupied by the Last Disk / Last LUN checkbox gadgets) */
     if (rdb && rdb->valid) {
-        char model[36], fsz[16];
+        char fsz[16];
         ULONG free_cyls = rdb->hi_cyl - rdb->lo_cyl + 1;
-        UQUAD free_bytes;
         UWORD fi;
-
         for (fi = 0; fi < rdb->num_parts; fi++) {
             ULONG used = rdb->parts[fi].high_cyl - rdb->parts[fi].low_cyl + 1;
             if (free_cyls >= used) free_cyls -= used;
         }
-        free_bytes = (UQUAD)free_cyls * rdb->heads * rdb->sectors * 512UL;
-        FormatSize(free_bytes, fsz);
-
-        /* prefer live SCSI INQUIRY brand; fall back to RDB-stored strings */
-        model[0] = '\0';
-        if (brand && brand[0])
-            strncpy(model, brand, 35);
-        else if (rdb->disk_vendor[0] || rdb->disk_product[0])
-            sprintf(model, "%s %s", rdb->disk_vendor, rdb->disk_product);
-        model[35] = '\0';
-
-        if (model[0])
-            sprintf(line2, "Model: %-20sRDB: %u partition%s     Free: %s",
-                    model, (unsigned)rdb->num_parts,
-                    rdb->num_parts == 1 ? "" : "s", fsz);
-        else
-            sprintf(line2, "RDB: %u part     Free: %s",
-                    (unsigned)rdb->num_parts, fsz);
+        FormatSize((UQUAD)free_cyls * rdb->heads * rdb->sectors * 512UL, fsz);
+        sprintf(line3, "RDB: %u partition%s         Free: %s",
+                (unsigned)rdb->num_parts,
+                rdb->num_parts == 1 ? "" : "s", fsz);
     } else {
-        /* No valid RDB — still show brand if we have one */
-        if (brand && brand[0])
-            sprintf(line2, "Model: %-24sRDB: Not found", brand);
-        else
-            sprintf(line2, "RDB: Not found  (disk is unpartitioned)");
+        strncpy(line3, "RDB: Not found", 119);
     }
+    line2[119] = line3[119] = '\0';
 
-    /* Clip line1 to window width */
     {
-        UWORD l1 = strlen(line1);
-        UWORD max_c = (UWORD)((iw - 4) / (UWORD)txw);
-        if (l1 > max_c) l1 = max_c;
+        UWORD max_full = (UWORD)((iw - 4) / (UWORD)txw);
+        UWORD max_l3   = (cb_res + 4 < iw) ? (UWORD)((iw - 4 - cb_res) / (UWORD)txw) : 0;
+        UWORD l;
+
+        l = (UWORD)strlen(line1); if (l > max_full) l = max_full;
         Move(rp, ix + 2, iy + fb);
-        Text(rp, line1, l1);
-    }
-    {
-        UWORD l2 = strlen(line2);
-        UWORD max_c = (UWORD)((iw - 4) / (UWORD)txw);
-        if (l2 > max_c) l2 = max_c;
-        Move(rp, ix + 2, iy + fh + 2 + fb);
-        Text(rp, line2, l2);
+        Text(rp, line1, l);
+
+        l = (UWORD)strlen(line2); if (l > max_full) l = max_full;
+        Move(rp, ix + 2, iy + (WORD)(fh + 2) + fb);
+        Text(rp, line2, l);
+
+        l = (UWORD)strlen(line3); if (l > max_l3) l = max_l3;
+        Move(rp, ix + 2, iy + (WORD)(fh + 2) * 2 + fb);
+        Text(rp, line3, l);
     }
 }
 
@@ -631,9 +643,13 @@ static void draw_static(struct Window *win, const char *devname, ULONG unit,
                          WORD ix, WORD iy, UWORD iw,   /* info section */
                          WORD bx, WORD by, UWORD bw, UWORD bh, /* map */
                          WORD hx, WORD hy, UWORD hw,   /* col header */
-                         WORD sel)
+                         WORD sel,
+                         struct Gadget *lastdisk_gad, struct Gadget *lastlun_gad)
 {
     draw_info(win, devname, unit, rdb, brand, ix, iy, iw);
+    /* draw_info erases the full info area including the checkbox slots —
+       refresh those two gadgets so they reappear over the cleared background. */
+    if (lastdisk_gad) RefreshGList(lastdisk_gad, win, NULL, lastlun_gad ? 2 : 1);
     draw_map (win, rdb, sel, bx, by, bw, bh);
     draw_col_header(win, hx, hy, hw);
 }
@@ -650,13 +666,6 @@ static void refresh_listview(struct Window *win, struct Gadget *lv_gad,
     GT_SetGadgetAttrsA(lv_gad, win, NULL, detach);
     build_part_list(rdb, sel);
     GT_SetGadgetAttrsA(lv_gad, win, NULL, reattach);
-}
-
-/* Sync the ">" marker without a full content rebuild */
-static void sync_listview_sel(struct Window *win, struct Gadget *lv_gad,
-                               struct RDBInfo *rdb, WORD sel)
-{
-    refresh_listview(win, lv_gad, rdb, sel);
 }
 
 /* ------------------------------------------------------------------ */
@@ -800,15 +809,20 @@ static ULONG parse_num(const char *s)
     while (*s == ' ') s++;
     if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) { s += 2; hex = 1; }
     while (*s) {
-        char c = *s++;
+        char  c = *s++;
+        ULONG digit;
         if (hex) {
-            if      (c >= '0' && c <= '9') val = val * 16 + (ULONG)(c - '0');
-            else if (c >= 'a' && c <= 'f') val = val * 16 + (ULONG)(c - 'a' + 10);
-            else if (c >= 'A' && c <= 'F') val = val * 16 + (ULONG)(c - 'A' + 10);
+            if      (c >= '0' && c <= '9') digit = (ULONG)(c - '0');
+            else if (c >= 'a' && c <= 'f') digit = (ULONG)(c - 'a' + 10);
+            else if (c >= 'A' && c <= 'F') digit = (ULONG)(c - 'A' + 10);
             else break;
+            if (val > (0xFFFFFFFFUL - digit) / 16UL) return 0xFFFFFFFFUL;
+            val = val * 16UL + digit;
         } else {
-            if (c >= '0' && c <= '9') val = val * 10 + (ULONG)(c - '0');
+            if (c >= '0' && c <= '9') digit = (ULONG)(c - '0');
             else break;
+            if (val > (0xFFFFFFFFUL - digit) / 10UL) return 0xFFFFFFFFUL;
+            val = val * 10UL + digit;
         }
     }
     return val;
@@ -1349,7 +1363,8 @@ static BOOL partition_dialog(struct PartInfo *pi, const char *title,
     ActivateGadget(name_gad, win, NULL);
 
     {
-        BOOL running = TRUE;
+        BOOL running    = TRUE;
+        BOOL need_reboot = FALSE;
         while (running) {
             struct IntuiMessage *imsg;
             WaitPort(win->UserPort);
@@ -1368,11 +1383,31 @@ static BOOL partition_dialog(struct PartInfo *pi, const char *title,
                         partition_advanced_dialog(pi);
                         break;
                     case PDLG_OK: {
+                        ULONG old_dos_type   = pi->dos_type;
+                        ULONG old_block_size = pi->block_size > 0 ? pi->block_size : 512;
+                        ULONG new_dos_type   = dlg_fs_dostypes[cur_fs];
+                        ULONG new_block_size = blocksize_values[cur_bsz];
+                        BOOL  destructive    = (new_dos_type   != old_dos_type ||
+                                                new_block_size != old_block_size);
+                        if (destructive) {
+                            struct EasyStruct es = {
+                                sizeof(struct EasyStruct), 0,
+                                DISKPART_VERTITLE " - Warning",
+                                "Changing the filesystem or block size\n"
+                                "will DESTROY ALL DATA on %s.\n\n"
+                                "Continue?",
+                                "Yes, destroy data|Cancel"
+                            };
+                            if (!EasyRequest(win, &es, NULL,
+                                             (ULONG)pi->drive_name, TAG_DONE))
+                                break; /* user cancelled — stay in dialog */
+                        }
+                        {
                         struct StringInfo *si;
                         si = (struct StringInfo *)name_gad->SpecialInfo;
                         strncpy(pi->drive_name, (char *)si->Buffer,
                                 sizeof(pi->drive_name)-1);
-                        pi->block_size = blocksize_values[cur_bsz];
+                        pi->block_size = new_block_size;
                         /* Convert Size (MB) to high_cyl */
                         {
                             ULONG eff_heads = pi->heads   > 0 ? pi->heads   : rdb->heads;
@@ -1406,8 +1441,11 @@ static BOOL partition_dialog(struct PartInfo *pi, const char *title,
                         if (!(automount_gad->Flags & GFLG_SELECTED)) pi->flags |= 2UL; /* PBFF_NOMOUNT */
                         if (  dirscsi_gad->Flags   & GFLG_SELECTED) pi->flags |= 4UL;
                         if (  syncscsi_gad->Flags  & GFLG_SELECTED) pi->flags |= 8UL;
-                        pi->dos_type = dlg_fs_dostypes[cur_fs];
-                        result = TRUE; running = FALSE; break;
+                        pi->dos_type = new_dos_type;
+                        if (destructive) need_reboot = TRUE;
+                        result = TRUE; running = FALSE;
+                        }
+                        break;
                     }
                     case PDLG_CANCEL: running = FALSE; break;
                     }
@@ -1416,6 +1454,17 @@ static BOOL partition_dialog(struct PartInfo *pi, const char *title,
                     GT_BeginRefresh(win); GT_EndRefresh(win, TRUE); break;
                 }
             }
+        }
+        if (need_reboot) {
+            struct EasyStruct es = {
+                sizeof(struct EasyStruct), 0,
+                DISKPART_VERTITLE,
+                "Filesystem or block size changed.\n"
+                "A reboot is required for this\n"
+                "partition to be recognised correctly.",
+                "OK"
+            };
+            EasyRequest(win, &es, NULL, TAG_DONE);
         }
     }
 
@@ -2138,16 +2187,20 @@ static BOOL build_gadgets(APTR vi,
                            UWORD bor_r, UWORD bor_b,
                            UWORD font_h,
                            struct TextAttr *font_ta,
+                           ULONG rdb_flags,
                            struct Gadget **out_glist,
                            struct Gadget **out_lv_gad,
+                           struct Gadget **out_lastdisk_gad,
+                           struct Gadget **out_lastlun_gad,
                            struct PartLayout *lay)
 {
     struct Gadget  *gctx = NULL, *glist = NULL, *lv = NULL, *prev;
+    struct Gadget  *ldisk = NULL, *llun = NULL;
     struct NewGadget ng;
     struct TagItem   bt[] = { { TAG_DONE, 0 } };
     UWORD inner_w = win_w - bor_l - bor_r;
     UWORD pad     = 4;
-    UWORD info_h  = font_h * 2 + 6;
+    UWORD info_h  = font_h * 3 + 8;
     UWORD map_h   = 40;
     UWORD lbl_h   = font_h + 4;
     UWORD hdr_h   = font_h + 3;
@@ -2219,8 +2272,43 @@ static BOOL build_gadgets(APTR vi,
     MKBTN(bor_l+pad+(seventh+pad)*6,      "Back",     GID_BACK)
 #undef MKBTN
 
-    *out_glist  = glist;
-    *out_lv_gad = lv;
+    /* Last Disk / Last LUN checkboxes — right-aligned on info line 3 */
+    {
+        struct TagItem cbt[] = { { GTCB_Checked, 0 }, { TAG_DONE, 0 } };
+        /* cbw must match the formula used in draw_info for the clip margin */
+        UWORD cbw   = (UWORD)(font_h * 2 + 82);
+        WORD  chk_y = (WORD)(bor_t + pad + (WORD)(font_h + 2) * 2);
+        UWORD chk_h = (UWORD)(font_h + 2);
+        WORD  cb_right = (WORD)(bor_l + inner_w - pad); /* right edge of iw */
+
+        cbt[0].ti_Data = (rdb_flags & RDBFF_LAST) ? 1UL : 0UL;
+        ng.ng_LeftEdge   = cb_right - (WORD)(cbw * 2 + pad * 3);
+        ng.ng_TopEdge    = chk_y;
+        ng.ng_Width      = cbw;
+        ng.ng_Height     = chk_h;
+        ng.ng_GadgetText = "Last Disk";
+        ng.ng_GadgetID   = GID_LASTDISK;
+        ng.ng_Flags      = PLACETEXT_RIGHT;
+        ldisk = CreateGadgetA(CHECKBOX_KIND, prev, &ng, cbt);
+        if (!ldisk) { FreeGadgets(glist); return FALSE; }
+        prev = ldisk;
+
+        cbt[0].ti_Data = (rdb_flags & RDBFF_LASTLUN) ? 1UL : 0UL;
+        ng.ng_LeftEdge   = cb_right - (WORD)cbw;
+        ng.ng_TopEdge    = chk_y;
+        ng.ng_Width      = cbw;
+        ng.ng_Height     = chk_h;
+        ng.ng_GadgetText = "Last LUN";
+        ng.ng_GadgetID   = GID_LASTLUN;
+        ng.ng_Flags      = PLACETEXT_RIGHT;
+        llun = CreateGadgetA(CHECKBOX_KIND, prev, &ng, cbt);
+        if (!llun) { FreeGadgets(glist); return FALSE; }
+    }
+
+    *out_glist        = glist;
+    *out_lv_gad       = lv;
+    *out_lastdisk_gad = ldisk;
+    *out_lastlun_gad  = llun;
     return TRUE;
 }
 
@@ -3388,9 +3476,8 @@ static void rdb_raw_scan(struct Window *win, struct BlockDev *bd)
             sprintf(line, "--- PART block at blk %lu ---", part_blk);
             vrdb_add(line);
 
-            /* Three-pass read matching RDB_Read / read2 (now 3 reads).
-               The A3000 SDMAC pipeline lag shifts by 2 bytes per read;
-               three reads fully drain it for all 512 bytes. */
+            /* Three-pass read matching RDB_Read: two priming reads then
+               the real read. */
             BlockDev_ReadBlock(bd, part_blk, buf);   /* prime 1 — discard */
             BlockDev_ReadBlock(bd, part_blk, buf);   /* prime 2 — discard */
             if (!BlockDev_ReadBlock(bd, part_blk, buf))
@@ -3556,7 +3643,7 @@ static void rdb_raw_scan(struct Window *win, struct BlockDev *bd)
         }
 
         if (!allok) {
-            vrdb_add("  (AllocVec failed - out of CHIP RAM)");
+            vrdb_add("  (AllocVec MEMF_PUBLIC failed)");
         } else {
             /* Re-scan for RDSK (<=16 CMD_READ into b[0]) */
             for (scan_b2 = 0; scan_b2 < 16; scan_b2++) {
@@ -4156,8 +4243,8 @@ static void raw_disk_read(struct Window *win, struct BlockDev *bd)
         if (id == IDNAME_RIGIDDISK) {
             /* RDSK fields */
             sprintf(line, "  Cyls=%lu  Heads=%lu  Secs=%lu",
-                    (unsigned long)lp[16], (unsigned long)lp[17],
-                    (unsigned long)lp[18]);
+                    (unsigned long)lp[16], (unsigned long)lp[18],
+                    (unsigned long)lp[17]);
             vrdb_add(line);
             sprintf(line, "  RDBlo=%lu  RDBhi=%lu  LoCyl=%lu  HiCyl=%lu",
                     (unsigned long)lp[22], (unsigned long)lp[23],
@@ -4311,13 +4398,10 @@ rdr_cleanup:
 /* ------------------------------------------------------------------ */
 /* diag_read_block — read one 512-byte block for diagnostic use only. */
 /*                                                                     */
-/* Tries HD_SCSICMD (SCSI READ(10)) first.  On the A3000 this issues  */
-/* the read directly through the WD33C93 without going through the    */
-/* trackdisk layer, potentially bypassing the SDMAC pipeline lag that  */
-/* causes CMD_READ to return shifted data.                             */
+/* Tries HD_SCSICMD (SCSI READ(10)) first, falls back to CMD_READ for  */
+/* devices that don't support HD_SCSICMD.                              */
 /*                                                                     */
-/* buf MUST be AllocVec'd with MEMF_PUBLIC — matches HDToolBox and lets */
-/* the A3000 SDMAC use the 32-bit fast-RAM DMA path.                   */
+/* buf MUST be AllocVec'd with MEMF_PUBLIC.                            */
 /*                                                                     */
 /* Returns:                                                            */
 /*   0  — success via HD_SCSICMD (SCSI path)                          */
@@ -4567,7 +4651,7 @@ static void show_about(struct Window *win)
     struct EasyStruct es;
     es.es_StructSize   = sizeof(es);
     es.es_Flags        = 0;
-    es.es_Title        = (UBYTE *)"About DiskPart";
+    es.es_Title        = (UBYTE *)"About " DISKPART_VERTITLE;
     es.es_TextFormat   = (UBYTE *)
         "DiskPart\n"
         "AmigaOS 3.x RDB Hard Disk Partition Editor\n"
@@ -4790,7 +4874,7 @@ geom_cleanup:
 /* ------------------------------------------------------------------ */
 
 static struct NewMenu partview_menu_def[] = {
-    { NM_TITLE, "DiskPart",              NULL,         0, 0, NULL },
+    { NM_TITLE, DISKPART_VERTITLE,        NULL,         0, 0, NULL },
     { NM_ITEM,  "About...",              NULL,         0, 0, NULL },
     { NM_TITLE, "Advanced",              NULL,         0, 0, NULL },
     { NM_ITEM,  "View RDB Block",        NULL,         0, 0, NULL },  /* ITEM 0 */
@@ -4813,8 +4897,10 @@ BOOL partview_run(const char *devname, ULONG unit)
     struct RDBInfo   *rdb      = NULL;
     struct Screen    *scr      = NULL;
     APTR              vi       = NULL;
-    struct Gadget    *glist    = NULL;
-    struct Gadget    *lv_gad   = NULL;
+    struct Gadget    *glist         = NULL;
+    struct Gadget    *lv_gad        = NULL;
+    struct Gadget    *lastdisk_gad  = NULL;
+    struct Gadget    *lastlun_gad   = NULL;
     struct Window    *win      = NULL;
     struct Menu      *menu     = NULL;
     WORD              sel      = -1;
@@ -4911,7 +4997,7 @@ BOOL partview_run(const char *devname, ULONG unit)
         UWORD bor_t   = (UWORD)scr->WBorTop + font_h + 1;
         UWORD bor_r   = (UWORD)scr->WBorRight;
         UWORD pad     = 4;
-        UWORD info_h  = font_h * 2 + 6;
+        UWORD info_h  = font_h * 3 + 8;
         UWORD map_h   = 40;
         UWORD lbl_h   = font_h + 4;
         UWORD hdr_h   = font_h + 3;
@@ -4928,7 +5014,7 @@ BOOL partview_run(const char *devname, ULONG unit)
         UWORD min_w   = bor_l + bor_r + pad * 2 + 7 * (40 + pad) - pad;
         UWORD min_h   = fixed_est + row_h * 2;
 
-        sprintf(win_title, "DiskPart - %s unit %lu", devname, (unsigned long)unit);
+        sprintf(win_title, DISKPART_VERTITLE " - %s unit %lu", devname, (unsigned long)unit);
 
         {
             struct TagItem wt[] = {
@@ -4968,7 +5054,8 @@ BOOL partview_run(const char *devname, ULONG unit)
                            (UWORD)win->Width,       (UWORD)win->Height,
                            (UWORD)win->BorderLeft,  (UWORD)win->BorderTop,
                            (UWORD)win->BorderRight, (UWORD)win->BorderBottom,
-                           fh, win->WScreen->Font, &glist, &lv_gad, &lay))
+                           fh, win->WScreen->Font, rdb->flags,
+                           &glist, &lv_gad, &lastdisk_gad, &lastlun_gad, &lay))
             goto cleanup;
 
         ix = lay.ix; iy = lay.iy; iw = lay.iw;
@@ -4983,7 +5070,7 @@ BOOL partview_run(const char *devname, ULONG unit)
            because WFLG_SIZEBBOTTOM enlarges BorderBottom unpredictably. */
         {
             UWORD pad2     = 4;
-            UWORD info_h2  = fh * 2 + 6;
+            UWORD info_h2  = fh * 3 + 8;
             UWORD map_h2   = 40;
             UWORD lbl_h2   = fh + 4;
             UWORD hdr_h2   = fh + 3;
@@ -5012,7 +5099,7 @@ BOOL partview_run(const char *devname, ULONG unit)
 
     GT_RefreshWindow(win, NULL);
     draw_static(win, devname, unit, rdb, (bd ? bd->disk_brand : ""),
-                ix, iy, iw, bx, by, bw, bh, hx, hy, hw, sel);
+                ix, iy, iw, bx, by, bw, bh, hx, hy, hw, sel, lastdisk_gad, lastlun_gad);
 
     /* ---- Event loop ---- */
     {
@@ -5066,7 +5153,7 @@ BOOL partview_run(const char *devname, ULONG unit)
                     LONG r;
                     es.es_StructSize = sizeof(es);
                     es.es_Flags      = 0;
-                    es.es_Title      = (UBYTE *)"DiskPart";
+                    es.es_Title      = (UBYTE *)DISKPART_VERTITLE;
                     if (dirty) {
                         es.es_TextFormat   = (UBYTE *)"You have unsaved changes.\nWrite partition table to disk?";
                         es.es_GadgetFormat = (UBYTE *)"Write|Discard|Cancel";
@@ -5154,7 +5241,7 @@ BOOL partview_run(const char *devname, ULONG unit)
                                                     ev_sec,  ev_mic)) {
                                         /* Double-click: open Edit dialog */
                                         sel = blk;
-                                        sync_listview_sel(win, lv_gad, rdb, sel);
+                                        refresh_listview(win, lv_gad, rdb, sel);
                                         dbl_part = -1;
                                         if (partition_dialog(&rdb->parts[sel],
                                                              "Edit Partition", rdb)) {
@@ -5162,7 +5249,7 @@ BOOL partview_run(const char *devname, ULONG unit)
                                             refresh_listview(win, lv_gad, rdb, sel);
                                             draw_static(win, devname, unit, rdb, (bd ? bd->disk_brand : ""),
                                                         ix, iy, iw, bx, by, bw, bh,
-                                                        hx, hy, hw, sel);
+                                                        hx, hy, hw, sel, lastdisk_gad, lastlun_gad);
                                         }
                                     } else {
                                         /* Single click: select partition */
@@ -5170,7 +5257,7 @@ BOOL partview_run(const char *devname, ULONG unit)
                                         dbl_part = blk;
                                         dbl_sec  = ev_sec;
                                         dbl_mic  = ev_mic;
-                                        sync_listview_sel(win, lv_gad, rdb, sel);
+                                        refresh_listview(win, lv_gad, rdb, sel);
                                         draw_map(win, rdb, sel, bx, by, bw, bh);
                                     }
                                 } else if (rdb->num_parts < MAX_PARTITIONS &&
@@ -5244,7 +5331,7 @@ BOOL partview_run(const char *devname, ULONG unit)
                             refresh_listview(win, lv_gad, rdb, sel);
                             draw_static(win, devname, unit, rdb, (bd ? bd->disk_brand : ""),
                                         ix, iy, iw, bx, by, bw, bh,
-                                        hx, hy, hw, sel);
+                                        hx, hy, hw, sel, lastdisk_gad, lastlun_gad);
                         } else if (drag_new) {
                             drag_new = FALSE;
                             /* Open Add Partition dialog with dragged range */
@@ -5277,7 +5364,7 @@ BOOL partview_run(const char *devname, ULONG unit)
                             }
                             draw_static(win, devname, unit, rdb, (bd ? bd->disk_brand : ""),
                                         ix, iy, iw, bx, by, bw, bh,
-                                        hx, hy, hw, sel);
+                                        hx, hy, hw, sel, lastdisk_gad, lastlun_gad);
                         }
                     }
                     break;
@@ -5347,9 +5434,19 @@ BOOL partview_run(const char *devname, ULONG unit)
                                 refresh_listview(win, lv_gad, rdb, sel);
                                 draw_static(win, devname, unit, rdb, (bd ? bd->disk_brand : ""),
                                             ix, iy, iw, bx, by, bw, bh,
-                                            hx, hy, hw, sel);
+                                            hx, hy, hw, sel, lastdisk_gad, lastlun_gad);
                             }
                         }
+                        break;
+
+                    case GID_LASTDISK:
+                        if (rdb) rdb->flags ^= RDBFF_LAST;
+                        dirty = TRUE;
+                        break;
+
+                    case GID_LASTLUN:
+                        if (rdb) rdb->flags ^= RDBFF_LASTLUN;
+                        dirty = TRUE;
                         break;
 
                     case GID_INITRDB: {
@@ -5427,12 +5524,15 @@ BOOL partview_run(const char *devname, ULONG unit)
                                 if (choice == 1) {
                                     /* Re-init */
                                     RDB_InitFresh(rdb, real_cyls, real_heads, real_secs);
+                                    { struct TagItem st[]={{GTCB_Checked,0},{TAG_DONE,0}};
+                                      if (lastdisk_gad) { st[0].ti_Data=(rdb->flags&RDBFF_LAST)?1:0;    GT_SetGadgetAttrsA(lastdisk_gad,win,NULL,st); }
+                                      if (lastlun_gad)  { st[0].ti_Data=(rdb->flags&RDBFF_LASTLUN)?1:0; GT_SetGadgetAttrsA(lastlun_gad, win,NULL,st); } }
                                     sel   = -1;
                                     dirty = TRUE;
                                     refresh_listview(win, lv_gad, rdb, sel);
                                     draw_static(win, devname, unit, rdb, (bd ? bd->disk_brand : ""),
                                                 ix, iy, iw, bx, by, bw, bh,
-                                                hx, hy, hw, sel);
+                                                hx, hy, hw, sel, lastdisk_gad, lastlun_gad);
                                 } else if (choice == 2) {
                                     /* Update Geometry (EXPERIMENTAL) */
                                     rdb->cylinders = real_cyls;
@@ -5442,7 +5542,7 @@ BOOL partview_run(const char *devname, ULONG unit)
                                     dirty = TRUE;
                                     draw_static(win, devname, unit, rdb, (bd ? bd->disk_brand : ""),
                                                 ix, iy, iw, bx, by, bw, bh,
-                                                hx, hy, hw, sel);
+                                                hx, hy, hw, sel, lastdisk_gad, lastlun_gad);
                                 } else if (choice == 3) {
                                     /* Manual — re-enter geometry, then re-show dialog */
                                     if (geometry_dialog(real_cyls, real_heads, real_secs,
@@ -5471,12 +5571,15 @@ BOOL partview_run(const char *devname, ULONG unit)
                                 if (choice == 1) {
                                     /* Yes */
                                     RDB_InitFresh(rdb, real_cyls, real_heads, real_secs);
+                                    { struct TagItem st[]={{GTCB_Checked,0},{TAG_DONE,0}};
+                                      if (lastdisk_gad) { st[0].ti_Data=(rdb->flags&RDBFF_LAST)?1:0;    GT_SetGadgetAttrsA(lastdisk_gad,win,NULL,st); }
+                                      if (lastlun_gad)  { st[0].ti_Data=(rdb->flags&RDBFF_LASTLUN)?1:0; GT_SetGadgetAttrsA(lastlun_gad, win,NULL,st); } }
                                     sel   = -1;
                                     dirty = TRUE;
                                     refresh_listview(win, lv_gad, rdb, sel);
                                     draw_static(win, devname, unit, rdb, (bd ? bd->disk_brand : ""),
                                                 ix, iy, iw, bx, by, bw, bh,
-                                                hx, hy, hw, sel);
+                                                hx, hy, hw, sel, lastdisk_gad, lastlun_gad);
                                 } else if (choice == 2) {
                                     /* Manual — re-enter geometry, then re-show dialog */
                                     if (geometry_dialog(real_cyls, real_heads, real_secs,
@@ -5496,6 +5599,9 @@ BOOL partview_run(const char *devname, ULONG unit)
                             if (rdb->cylinders == 0) break;
                             RDB_InitFresh(rdb, rdb->cylinders,
                                           rdb->heads, rdb->sectors);
+                            { struct TagItem st[]={{GTCB_Checked,0},{TAG_DONE,0}};
+                              if (lastdisk_gad) { st[0].ti_Data=(rdb->flags&RDBFF_LAST)?1:0;    GT_SetGadgetAttrsA(lastdisk_gad,win,NULL,st); }
+                              if (lastlun_gad)  { st[0].ti_Data=(rdb->flags&RDBFF_LASTLUN)?1:0; GT_SetGadgetAttrsA(lastlun_gad, win,NULL,st); } }
                         }
                         if (rdb->num_parts >= MAX_PARTITIONS) break;
                         find_free_range(rdb, &lo, &hi);
@@ -5528,7 +5634,7 @@ BOOL partview_run(const char *devname, ULONG unit)
                             refresh_listview(win, lv_gad, rdb, sel);
                             draw_static(win, devname, unit, rdb, (bd ? bd->disk_brand : ""),
                                         ix, iy, iw, bx, by, bw, bh,
-                                        hx, hy, hw, sel);
+                                        hx, hy, hw, sel, lastdisk_gad, lastlun_gad);
                         }
                         break;
                     }
@@ -5541,7 +5647,7 @@ BOOL partview_run(const char *devname, ULONG unit)
                                 refresh_listview(win, lv_gad, rdb, sel);
                                 draw_static(win, devname, unit, rdb, (bd ? bd->disk_brand : ""),
                                             ix, iy, iw, bx, by, bw, bh,
-                                            hx, hy, hw, sel);
+                                            hx, hy, hw, sel, lastdisk_gad, lastlun_gad);
                             }
                         }
                         break;
@@ -5570,7 +5676,7 @@ BOOL partview_run(const char *devname, ULONG unit)
                                 refresh_listview(win, lv_gad, rdb, sel);
                                 draw_static(win, devname, unit, rdb, (bd ? bd->disk_brand : ""),
                                             ix, iy, iw, bx, by, bw, bh,
-                                            hx, hy, hw, sel);
+                                            hx, hy, hw, sel, lastdisk_gad, lastlun_gad);
                             }
                         }
                         break;
@@ -5580,7 +5686,7 @@ BOOL partview_run(const char *devname, ULONG unit)
                             struct EasyStruct es;
                             es.es_StructSize   = sizeof(es);
                             es.es_Flags        = 0;
-                            es.es_Title        = (UBYTE *)"DiskPart";
+                            es.es_Title        = (UBYTE *)DISKPART_VERTITLE;
                             es.es_TextFormat   = (UBYTE *)"No RDB found.\nInit RDB first.";
                             es.es_GadgetFormat = (UBYTE *)"OK";
                             EasyRequest(win, &es, NULL);
@@ -5594,7 +5700,7 @@ BOOL partview_run(const char *devname, ULONG unit)
                         struct EasyStruct es;
                         es.es_StructSize   = sizeof(es);
                         es.es_Flags        = 0;
-                        es.es_Title        = (UBYTE *)"DiskPart";
+                        es.es_Title        = (UBYTE *)DISKPART_VERTITLE;
                         es.es_TextFormat   = (UBYTE *)"Write partition table to disk?\nAll existing data may be lost!";
                         es.es_GadgetFormat = (UBYTE *)"Write|Cancel";
                         if (EasyRequest(win, &es, NULL) == 1) {
@@ -5642,7 +5748,7 @@ BOOL partview_run(const char *devname, ULONG unit)
                             LONG r;
                             es.es_StructSize   = sizeof(es);
                             es.es_Flags        = 0;
-                            es.es_Title        = (UBYTE *)"DiskPart";
+                            es.es_Title        = (UBYTE *)DISKPART_VERTITLE;
                             es.es_TextFormat   = (UBYTE *)"You have unsaved changes.\nWrite partition table to disk?";
                             es.es_GadgetFormat = (UBYTE *)"Write|Discard|Cancel";
                             r = EasyRequest(win, &es, NULL);
@@ -5673,6 +5779,7 @@ BOOL partview_run(const char *devname, ULONG unit)
 
                 case IDCMP_NEWSIZE: {
                     struct Gadget    *new_glist = NULL, *new_lv = NULL;
+                    struct Gadget    *new_ldisk = NULL, *new_llun = NULL;
                     struct PartLayout new_lay;
                     UWORD fh = (UWORD)win->WScreen->Font->ta_YSize;
 
@@ -5686,14 +5793,18 @@ BOOL partview_run(const char *devname, ULONG unit)
                     RemoveGList(win, glist, -1);
                     FreeGadgets(glist);
                     glist = NULL; lv_gad = NULL;
+                    lastdisk_gad = NULL; lastlun_gad = NULL;
 
                     if (build_gadgets(vi,
                                       (UWORD)win->Width,  (UWORD)win->Height,
                                       (UWORD)win->BorderLeft,  (UWORD)win->BorderTop,
                                       (UWORD)win->BorderRight, (UWORD)win->BorderBottom,
-                                      fh, win->WScreen->Font, &new_glist, &new_lv, &new_lay)) {
+                                      fh, win->WScreen->Font, rdb->flags,
+                                      &new_glist, &new_lv, &new_ldisk, &new_llun, &new_lay)) {
                         glist  = new_glist;
                         lv_gad = new_lv;
+                        lastdisk_gad = new_ldisk;
+                        lastlun_gad  = new_llun;
                         ix = new_lay.ix; iy = new_lay.iy; iw = new_lay.iw;
                         bx = new_lay.bx; by = new_lay.by;
                         bw = new_lay.bw; bh = new_lay.bh;
@@ -5715,7 +5826,7 @@ BOOL partview_run(const char *devname, ULONG unit)
 
                         draw_static(win, devname, unit, rdb, (bd ? bd->disk_brand : ""),
                                     ix, iy, iw, bx, by, bw, bh,
-                                    hx, hy, hw, sel);
+                                    hx, hy, hw, sel, lastdisk_gad, lastlun_gad);
                     }
                     break;
                 }
@@ -5725,7 +5836,7 @@ BOOL partview_run(const char *devname, ULONG unit)
                     GT_EndRefresh(win, TRUE);
                     draw_static(win, devname, unit, rdb, (bd ? bd->disk_brand : ""),
                                 ix, iy, iw, bx, by, bw, bh,
-                                hx, hy, hw, sel);
+                                hx, hy, hw, sel, lastdisk_gad, lastlun_gad);
                     break;
                 }
             }

@@ -1,0 +1,7 @@
+#ifndef VERSION_H
+#define VERSION_H
+
+#define DISKPART_VERSION  "V0.1"
+#define DISKPART_VERTITLE "DiskPart " DISKPART_VERSION
+
+#endif /* VERSION_H */

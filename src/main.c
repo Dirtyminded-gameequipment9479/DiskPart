@@ -32,6 +32,9 @@
 #include "clib.h"
 #include "devices.h"
 #include "partview.h"
+#include "version.h"
+
+static const char diskpart_ver[] = "$VER: DiskPart 0.1 (2026)";
 
 /* ------------------------------------------------------------------ */
 /* Library bases — SysBase set by main() before any LP call            */
@@ -84,6 +87,7 @@ static BOOL str_contains_ci(const char *hay, const char *needle)
         BOOL  match = TRUE;
         for (i = 0; i < nlen; i++) {
             char h = hay[i], n = needle[i];
+            if (!h) { match = FALSE; break; }  /* hay shorter than needle */
             if (h >= 'A' && h <= 'Z') h += 32;
             if (h != n) { match = FALSE; break; }
         }
@@ -138,7 +142,7 @@ static BOOL confirm_exit(struct Window *win)
     struct EasyStruct es;
     es.es_StructSize   = sizeof(es);
     es.es_Flags        = 0;
-    es.es_Title        = (UBYTE *)"DiskPart";
+    es.es_Title        = (UBYTE *)DISKPART_VERTITLE;
     es.es_TextFormat   = (UBYTE *)"Exit DiskPart?";
     es.es_GadgetFormat = (UBYTE *)"Yes|No";
     return (BOOL)(EasyRequestArgs(win, &es, NULL, NULL) == 1);
@@ -268,7 +272,7 @@ static WORD run_devname_window(void)
                 { WA_Top,       (ULONG)((scr->Height - win_h) / 2) },
                 { WA_Width,     win_w },
                 { WA_Height,    win_h },
-                { WA_Title,     (ULONG)"DiskPart - Select Device" },
+                { WA_Title,     (ULONG)DISKPART_VERTITLE " - Select Device" },
                 { WA_Gadgets,   (ULONG)glist },
                 { WA_PubScreen, (ULONG)scr },
                 { WA_IDCMP,     IDCMP_CLOSEWINDOW | IDCMP_GADGETUP |
@@ -402,7 +406,7 @@ static void probe_win_cb(void *ud, ULONG unit, UWORD phase, const char *info)
     struct ProbeWin *pw = (struct ProbeWin *)ud;
     struct RastPort *rp;
     char   buf[128];
-    WORD   len, pad, i;
+    WORD   len, pad;
 
     if (!pw->win) return;
     rp = pw->win->RPort;
@@ -434,7 +438,6 @@ static void probe_win_cb(void *ud, ULONG unit, UWORD phase, const char *info)
         break;
     }
 
-    (void)i;  /* suppress unused warning */
 }
 
 static void probe_win_open(struct ProbeWin *pw, const char *devname)
@@ -443,7 +446,7 @@ static void probe_win_open(struct ProbeWin *pw, const char *devname)
     UWORD fh, bor_l, bor_t, bor_r, bor_b, pad, lh, win_w, win_h, rows;
 
     memset(pw, 0, sizeof(*pw));
-    sprintf(pw->title, "Probing %s", devname);
+    sprintf(pw->title, DISKPART_VERTITLE " - Probing %s", devname);
 
     scr = LockPubScreen(NULL);
     if (!scr) return;
@@ -536,7 +539,7 @@ static WORD run_unitsel_window(const char *devname)
         AddTail(&ulist, &unit_nodes[i]);
     }
 
-    sprintf(win_title, "DiskPart - %s", devname);
+    sprintf(win_title, DISKPART_VERTITLE " - %s", devname);
 
     scr = LockPubScreen(NULL);
     if (!scr) goto cleanup;
@@ -762,8 +765,6 @@ int main(void)
 
             while (!quit && (unit_idx = run_unitsel_window(devname)) >= 0) {
                 if (partview_run(devname, unit_list.entries[unit_idx].unit))
-                    quit = TRUE;
-                else if (unit_idx == RESULT_EXIT)
                     quit = TRUE;
             }
             if (quit || unit_idx == RESULT_EXIT) break;
