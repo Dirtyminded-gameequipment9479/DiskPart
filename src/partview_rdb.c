@@ -2364,3 +2364,793 @@ hexdump_cleanup:
         if (scr)     UnlockPubScreen(NULL, scr);
     }
 }
+
+/* ------------------------------------------------------------------ */
+/* SMART attribute name lookup table                                   */
+/* ------------------------------------------------------------------ */
+
+static const struct { UBYTE id; const char *name; } smart_names[] = {
+    {   1, "Raw Read Error Rate"    },
+    {   3, "Spin Up Time"           },
+    {   4, "Start/Stop Count"       },
+    {   5, "Reallocated Sector Ct"  },
+    {   7, "Seek Error Rate"        },
+    {   9, "Power On Hours"         },
+    {  10, "Spin Retry Count"       },
+    {  11, "Calibration Retry Ct"   },
+    {  12, "Power Cycle Count"      },
+    { 177, "Wear Leveling Count"    },
+    { 179, "Used Reserved Blk Ct"   },
+    { 181, "Program Fail Ct Total"  },
+    { 182, "Erase Fail Ct Total"    },
+    { 183, "Runtime Bad Block"      },
+    { 187, "Reported Uncorrect"     },
+    { 188, "Command Timeout"        },
+    { 189, "High Fly Writes"        },
+    { 190, "Airflow Temperature"    },
+    { 191, "G-Sense Error Rate"     },
+    { 192, "Power-Off Retract Ct"   },
+    { 193, "Load/Unload Cycle Ct"   },
+    { 194, "Temperature Celsius"    },
+    { 196, "Reallocation Event Ct"  },
+    { 197, "Current Pending Sector" },
+    { 198, "Offline Uncorrectable"  },
+    { 199, "UDMA CRC Error Count"   },
+    { 200, "Multi Zone Error Rate"  },
+    { 241, "Total LBAs Written"     },
+    { 242, "Total LBAs Read"        },
+    {   0, NULL                     }
+};
+
+static const char *smart_attr_name(UBYTE id)
+{
+    int i;
+    for (i = 0; smart_names[i].name; i++)
+        if (smart_names[i].id == id) return smart_names[i].name;
+    return "Unknown Attribute";
+}
+
+/* ------------------------------------------------------------------ */
+/* smart_send — issue one SMART sub-command via ATA PASS-THROUGH.     */
+/*                                                                     */
+/* feature : ATA FEATURES register value:                             */
+/*   0xD0 = READ DATA, 0xD1 = READ THRESHOLDS, 0xD8 = ENABLE OPS     */
+/* buf     : 512-byte MEMF_PUBLIC buffer for data-in commands, or     */
+/*           NULL for non-data commands (e.g. 0xD8 ENABLE).           */
+/*                                                                     */
+/* Returns: 0  = ok via 16-byte ATA PASS-THROUGH(16) CDB             */
+/*          1  = ok via 12-byte ATA PASS-THROUGH(12) fallback         */
+/*         -1  = command failed on both CDB lengths                   */
+/*         -2  = HD_SCSICMD not supported by driver                   */
+/* ------------------------------------------------------------------ */
+
+static int smart_send(struct BlockDev *bd, UBYTE feature, UBYTE *buf)
+{
+    struct SCSICmd scmd;
+    UBYTE          cdb[16];
+    UBYTE          sense[32];
+    BYTE           err;
+    BOOL           has_data = (BOOL)(buf != NULL);
+
+    memset(&scmd, 0, sizeof(scmd));
+    memset(cdb,   0, sizeof(cdb));
+    memset(sense, 0, sizeof(sense));
+
+    /* ATA PASS-THROUGH(16), SAT-2 encoding.
+       cdb[1]: PROTOCOL field (bits 4:1): 4=PIO Data-In, 3=Non-data.
+       cdb[2]: T_DIR(bit3)|BYTE_BLOCK(bit2)|T_LENGTH(bits1:0)=2 for data.  */
+    cdb[0]  = 0x85;
+    cdb[1]  = has_data ? 0x08 : 0x06;   /* PIO-In(4<<1) or Non-data(3<<1) */
+    cdb[2]  = has_data ? 0x0E : 0x00;   /* T_DIR|BYTE_BLOCK|T_LENGTH=2    */
+    cdb[4]  = feature;                   /* ATA FEATURES register           */
+    cdb[6]  = has_data ? 1 : 0;         /* ATA SECTOR COUNT = 1 block      */
+    cdb[10] = 0x4F;                      /* ATA LBA MID — SMART signature   */
+    cdb[12] = 0xC2;                      /* ATA LBA HIGH — SMART signature  */
+    cdb[14] = 0xB0;                      /* ATA COMMAND = SMART             */
+
+    scmd.scsi_Data        = has_data ? (UWORD *)buf : NULL;
+    scmd.scsi_Length      = has_data ? 512 : 0;
+    scmd.scsi_Command     = cdb;
+    scmd.scsi_CmdLength   = 16;
+    scmd.scsi_Flags       = has_data ? SCSIF_READ : 0;
+    scmd.scsi_SenseData   = sense;
+    scmd.scsi_SenseLength = sizeof(sense);
+
+    bd->iotd.iotd_Req.io_Command = HD_SCSICMD;
+    bd->iotd.iotd_Req.io_Length  = sizeof(scmd);
+    bd->iotd.iotd_Req.io_Data    = (APTR)&scmd;
+    bd->iotd.iotd_Req.io_Flags   = 0;
+    bd->iotd.iotd_Count          = 0;
+    err = (BYTE)DoIO((struct IORequest *)&bd->iotd);
+
+    if (err == 0)           return 0;
+    if (err == IOERR_NOCMD) return -2;
+
+    /* Fall back to ATA PASS-THROUGH(12): same semantics, shorter CDB. */
+    {
+        UBYTE cdb12[12];
+        memset(&scmd,  0, sizeof(scmd));
+        memset(cdb12,  0, sizeof(cdb12));
+        memset(sense,  0, sizeof(sense));
+
+        cdb12[0] = 0xA1;
+        cdb12[1] = has_data ? 0x08 : 0x06;
+        cdb12[2] = has_data ? 0x0E : 0x00;
+        cdb12[3] = feature;
+        cdb12[4] = has_data ? 1 : 0;
+        cdb12[6] = 0x4F;
+        cdb12[7] = 0xC2;
+        cdb12[9] = 0xB0;
+
+        scmd.scsi_Data        = has_data ? (UWORD *)buf : NULL;
+        scmd.scsi_Length      = has_data ? 512 : 0;
+        scmd.scsi_Command     = cdb12;
+        scmd.scsi_CmdLength   = 12;
+        scmd.scsi_Flags       = has_data ? SCSIF_READ : 0;
+        scmd.scsi_SenseData   = sense;
+        scmd.scsi_SenseLength = sizeof(sense);
+
+        bd->iotd.iotd_Req.io_Command = HD_SCSICMD;
+        bd->iotd.iotd_Req.io_Length  = sizeof(scmd);
+        bd->iotd.iotd_Req.io_Data    = (APTR)&scmd;
+        bd->iotd.iotd_Req.io_Flags   = 0;
+        bd->iotd.iotd_Count          = 0;
+        err = (BYTE)DoIO((struct IORequest *)&bd->iotd);
+
+        if (err == 0) return 1;
+    }
+
+    return -1;
+}
+
+/* ------------------------------------------------------------------ */
+/* smart_status — display ATA SMART health data for the open device.  */
+/* ------------------------------------------------------------------ */
+
+void smart_status(struct Window *win, struct BlockDev *bd)
+{
+    struct EasyStruct  es;
+    UBYTE             *data_buf = NULL;
+    UBYTE             *thr_buf  = NULL;
+    char               line[80];
+    int                rc;
+    BOOL               thr_ok   = FALSE;
+    BOOL               any_fail = FALSE;
+    WORD               i, j;
+
+    es.es_StructSize = sizeof(es);
+    es.es_Flags      = 0;
+    es.es_Title      = (UBYTE *)"SMART Status";
+
+    if (!bd) {
+        es.es_TextFormat   = (UBYTE *)"No device open.";
+        es.es_GadgetFormat = (UBYTE *)"OK";
+        EasyRequest(win, &es, NULL);
+        return;
+    }
+
+    /* Buffers for DMA — MEMF_PUBLIC required for hardware DMA access. */
+    data_buf = (UBYTE *)AllocVec(512, MEMF_PUBLIC | MEMF_CLEAR);
+    thr_buf  = (UBYTE *)AllocVec(512, MEMF_PUBLIC | MEMF_CLEAR);
+    if (!data_buf || !thr_buf) {
+        if (data_buf) FreeVec(data_buf);
+        if (thr_buf)  FreeVec(thr_buf);
+        return;
+    }
+
+    vrdb_count = 0;
+    vrdb_list.lh_Head     = (struct Node *)&vrdb_list.lh_Tail;
+    vrdb_list.lh_Tail     = NULL;
+    vrdb_list.lh_TailPred = (struct Node *)&vrdb_list.lh_Head;
+
+    vrdb_add("=== SMART Status ===");
+    if (bd->disk_brand[0]) {
+        sprintf(line, "  Drive: %s", bd->disk_brand);
+        vrdb_add(line);
+    }
+    vrdb_add("");
+
+    smart_send(bd, 0xD8, NULL);          /* SMART ENABLE OPERATIONS (best effort) */
+
+    rc = smart_send(bd, 0xD0, data_buf); /* SMART READ DATA */
+
+    if (rc == -2) {
+        vrdb_add("  ATA SMART not supported:");
+        vrdb_add("  Device or driver does not implement HD_SCSICMD /");
+        vrdb_add("  ATA PASS-THROUGH.");
+        goto smart_show;
+    }
+    if (rc < 0) {
+        vrdb_add("  SMART READ DATA command failed.");
+        vrdb_add("  Drive may not support SMART, or the driver does not");
+        vrdb_add("  support ATA PASS-THROUGH CDBs.");
+        goto smart_show;
+    }
+    if (data_buf[0] == 0 && data_buf[1] == 0) {
+        vrdb_add("  SMART returned all-zero data.");
+        vrdb_add("  Drive may not support SMART.");
+        goto smart_show;
+    }
+
+    sprintf(line, "  Data structure revision: 0x%02X%02X",
+            (unsigned)data_buf[1], (unsigned)data_buf[0]);
+    vrdb_add(line);
+
+    thr_ok = (BOOL)(smart_send(bd, 0xD1, thr_buf) >= 0); /* READ THRESHOLDS */
+
+    /* Pass 1: determine overall health from pre-failure attributes.
+       An attribute fails when: pre-failure flag set AND current < threshold. */
+    for (i = 0; i < 30; i++) {
+        UBYTE *attr    = data_buf + 2 + i * 12;
+        UBYTE  id      = attr[0];
+        UBYTE  cur     = attr[3];
+        UBYTE  thr_val = 0;
+        UWORD  flags;
+
+        if (id == 0) continue;
+        flags = (UWORD)attr[1] | ((UWORD)attr[2] << 8);
+        if (thr_ok) {
+            for (j = 0; j < 30; j++) {
+                if (thr_buf[2 + j*12] == id) {
+                    thr_val = thr_buf[2 + j*12 + 3];
+                    break;
+                }
+            }
+        }
+        if (thr_val > 0 && cur < thr_val && (flags & 0x0001))
+            any_fail = TRUE;
+    }
+
+    if (any_fail)
+        vrdb_add("  Overall health: ** FAILED ** (pre-failure threshold exceeded)");
+    else if (thr_ok)
+        vrdb_add("  Overall health: PASSED");
+    else
+        vrdb_add("  Overall health: UNKNOWN (threshold data unavailable)");
+    vrdb_add("");
+    vrdb_add("   ID Name                    Cur  Wst  Thr       Raw  Status");
+    vrdb_add("  ---+------------------------+----+----+----+-----------+------");
+
+    /* Pass 2: display each attribute. */
+    for (i = 0; i < 30; i++) {
+        UBYTE *attr    = data_buf + 2 + i * 12;
+        UBYTE  id      = attr[0];
+        UBYTE  cur     = attr[3];
+        UBYTE  wst     = attr[4];
+        UBYTE  thr_val = 0;
+        ULONG  raw32;
+        const char *status;
+
+        if (id == 0) continue;
+
+        /* Raw value: 6 bytes little-endian; show lower 32 bits. */
+        raw32 = (ULONG)attr[5]
+              | ((ULONG)attr[6] << 8)
+              | ((ULONG)attr[7] << 16)
+              | ((ULONG)attr[8] << 24);
+
+        if (thr_ok) {
+            for (j = 0; j < 30; j++) {
+                if (thr_buf[2 + j*12] == id) {
+                    thr_val = thr_buf[2 + j*12 + 3];
+                    break;
+                }
+            }
+        }
+
+        if      (!thr_ok || thr_val == 0) status = "----";
+        else if (cur < thr_val)           status = "FAIL";
+        else                              status = "OK";
+
+        sprintf(line, "  %3d %-22s  %3d  %3d  %3d  %10lu  %s",
+                (int)id, smart_attr_name(id),
+                (int)cur, (int)wst, (int)thr_val,
+                (unsigned long)raw32, status);
+        vrdb_add(line);
+    }
+
+smart_show:
+    FreeVec(data_buf); data_buf = NULL;
+    FreeVec(thr_buf);  thr_buf  = NULL;
+
+    {
+        struct Screen *scr   = NULL;
+        APTR           vi    = NULL;
+        struct Gadget *glist = NULL;
+        struct Window *vwin  = NULL;
+        UWORD font_h, bor_t, bor_b, pad, row_h, btn_h, win_w, win_h, min_h, scr_w, scr_h;
+
+        scr = LockPubScreen(NULL);
+        if (!scr) return;
+        vi = GetVisualInfoA(scr, NULL);
+        if (!vi) { UnlockPubScreen(NULL, scr); return; }
+
+        font_h = scr->Font->ta_YSize;
+        bor_t  = scr->WBorTop + font_h + 1;
+        bor_b  = scr->WBorBottom;
+        pad    = 4;
+        row_h  = font_h + 2;
+        btn_h  = font_h + 6;
+        win_w  = 560;
+        win_h  = bor_t + pad + row_h * 22 + pad + btn_h + pad + bor_b;
+        min_h  = bor_t + pad + row_h *  5 + pad + btn_h + pad + bor_b;
+        scr_w  = scr->Width;
+        scr_h  = scr->Height;
+
+        if (!vrdb_make_gadgets(vi, scr, win_w, win_h, &glist))
+            goto smart_win_cleanup;
+
+        { struct TagItem wt[] = {
+              { WA_Left,      (ULONG)((scr_w - win_w) / 2) },
+              { WA_Top,       (ULONG)((scr_h - win_h) / 2) },
+              { WA_Width,     win_w }, { WA_Height,    win_h },
+              { WA_Title,     (ULONG)"SMART Status" },
+              { WA_Gadgets,   (ULONG)glist },
+              { WA_PubScreen, (ULONG)scr },
+              { WA_IDCMP,     IDCMP_CLOSEWINDOW | IDCMP_GADGETUP |
+                              IDCMP_NEWSIZE | IDCMP_REFRESHWINDOW },
+              { WA_Flags,     WFLG_DRAGBAR | WFLG_DEPTHGADGET |
+                              WFLG_CLOSEGADGET | WFLG_ACTIVATE | WFLG_SIMPLE_REFRESH |
+                              WFLG_SIZEGADGET | WFLG_SIZEBBOTTOM },
+              { WA_MinWidth,  300 }, { WA_MinHeight, min_h },
+              { WA_MaxWidth,  scr_w }, { WA_MaxHeight, scr_h },
+              { TAG_DONE, 0 } };
+          vwin = OpenWindowTagList(NULL, wt); }
+
+        UnlockPubScreen(NULL, scr); scr = NULL;
+        if (!vwin) goto smart_win_cleanup;
+        GT_RefreshWindow(vwin, NULL);
+
+        { BOOL running = TRUE;
+          while (running) {
+              struct IntuiMessage *imsg;
+              WaitPort(vwin->UserPort);
+              while ((imsg = GT_GetIMsg(vwin->UserPort)) != NULL) {
+                  ULONG  iclass = imsg->Class;
+                  struct Gadget *gad = (struct Gadget *)imsg->IAddress;
+                  GT_ReplyIMsg(imsg);
+                  switch (iclass) {
+                  case IDCMP_CLOSEWINDOW:
+                      running = FALSE; break;
+                  case IDCMP_NEWSIZE: {
+                      struct Gadget *ng2 = NULL;
+                      RemoveGList(vwin, glist, -1);
+                      FreeGadgets(glist); glist = NULL;
+                      if (vrdb_make_gadgets(vi, vwin->WScreen,
+                                            (UWORD)vwin->Width, (UWORD)vwin->Height, &ng2)) {
+                          glist = ng2;
+                          AddGList(vwin, glist, ~0, -1, NULL);
+                          RefreshGList(glist, vwin, NULL, -1);
+                      }
+                      GT_RefreshWindow(vwin, NULL);
+                      break; }
+                  case IDCMP_GADGETUP:
+                      if (gad->GadgetID == VRDB_DONE) running = FALSE; break;
+                  case IDCMP_REFRESHWINDOW:
+                      GT_BeginRefresh(vwin); GT_EndRefresh(vwin, TRUE); break;
+                  }
+              }
+          }
+        }
+
+smart_win_cleanup:
+        if (vwin)  { RemoveGList(vwin, glist, -1); CloseWindow(vwin); }
+        if (glist)   FreeGadgets(glist);
+        if (vi)      FreeVisualInfo(vi);
+        if (scr)     UnlockPubScreen(NULL, scr);
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* write_badb — write a BADB chain to the RDB reserved area and patch */
+/* the RDSK header to point BadBlockList at it.                       */
+/*                                                                     */
+/* bbe_GoodBlock is set to RDB_END_MARK (no replacement block) for    */
+/* each entry — marks the sector as unrecoverable.                    */
+/* ------------------------------------------------------------------ */
+
+static BOOL write_badb(struct Window *win, struct BlockDev *bd,
+                       const struct RDBInfo *rdb,
+                       const ULONG *bad_blocks, ULONG bad_count)
+{
+    UBYTE                *buf          = NULL;
+    ULONG                 badb_start;
+    ULONG                 num_badb_blks;
+    ULONG                 entries_per  = 61;   /* (512 - 24) / 8 */
+    ULONG                 b, i, idx, sum;
+    struct BadBlockBlock  *badb;
+    struct RigidDiskBlock *rdsk;
+    struct EasyStruct     es;
+    BOOL                  ok = FALSE;
+
+    es.es_StructSize = sizeof(es);
+    es.es_Flags      = 0;
+    es.es_Title      = (UBYTE *)"Bad Block List";
+
+    badb_start    = rdb->rdb_block_hi + 1;
+    num_badb_blks = (bad_count == 0) ? 1 :
+                    (bad_count + entries_per - 1) / entries_per;
+
+    /* Ensure BADB blocks don't overlap the first partition cylinder. */
+    if (rdb->lo_cyl > 0 && rdb->heads > 0 && rdb->sectors > 0) {
+        ULONG first_part_blk = rdb->lo_cyl * rdb->heads * rdb->sectors;
+        if (badb_start + num_badb_blks > first_part_blk) {
+            es.es_TextFormat   = (UBYTE *)"Not enough space in the RDB\nreserved area for a bad block list.";
+            es.es_GadgetFormat = (UBYTE *)"OK";
+            EasyRequest(win, &es, NULL);
+            return FALSE;
+        }
+    }
+
+    buf = (UBYTE *)AllocVec(512, MEMF_PUBLIC | MEMF_CLEAR);
+    if (!buf) return FALSE;
+
+    /* Write each BADB block */
+    for (b = 0; b < num_badb_blks; b++) {
+        ULONG this_blk    = badb_start + b;
+        ULONG next_blk    = (b + 1 < num_badb_blks) ?
+                             badb_start + b + 1 : RDB_END_MARK;
+        ULONG entry_start = b * entries_per;
+        ULONG entry_end   = entry_start + entries_per;
+        if (entry_end > bad_count) entry_end = bad_count;
+
+        memset(buf, 0, 512);
+        badb = (struct BadBlockBlock *)buf;
+        badb->bbb_ID          = IDNAME_BADBLOCK;
+        badb->bbb_SummedLongs = 512 / 4;   /* 128 longs */
+        badb->bbb_ChkSum      = 0;
+        badb->bbb_HostID      = 7;
+        badb->bbb_Next        = next_blk;
+        badb->bbb_Reserved    = 0;
+
+        for (i = entry_start; i < entry_end; i++) {
+            badb->bbb_BlockPairs[i - entry_start].bbe_BadBlock  = bad_blocks[i];
+            badb->bbb_BlockPairs[i - entry_start].bbe_GoodBlock = RDB_END_MARK;
+        }
+
+        /* Checksum: negate sum of all 128 longs. */
+        sum = 0;
+        for (idx = 0; idx < 128; idx++) sum += ((ULONG *)buf)[idx];
+        badb->bbb_ChkSum = (LONG)(-(LONG)sum);
+
+        if (!BlockDev_WriteBlock(bd, this_blk, buf)) {
+            es.es_TextFormat   = (UBYTE *)"Failed to write BADB block to disk.";
+            es.es_GadgetFormat = (UBYTE *)"OK";
+            EasyRequest(win, &es, NULL);
+            goto badb_done;
+        }
+    }
+
+    /* Patch RDSK: update BadBlockList and extend RDBBlocksHi. */
+    if (!BlockDev_ReadBlock(bd, rdb->block_num, buf)) {
+        es.es_TextFormat   = (UBYTE *)"Failed to read RDSK block for update.";
+        es.es_GadgetFormat = (UBYTE *)"OK";
+        EasyRequest(win, &es, NULL);
+        goto badb_done;
+    }
+    rdsk = (struct RigidDiskBlock *)buf;
+    rdsk->rdb_BadBlockList  = badb_start;
+    rdsk->rdb_RDBBlocksHi   = badb_start + num_badb_blks - 1;
+    rdsk->rdb_HighRDSKBlock = rdsk->rdb_RDBBlocksHi;
+    rdsk->rdb_ChkSum        = 0;
+    sum = 0;
+    for (idx = 0; idx < rdsk->rdb_SummedLongs; idx++)
+        sum += ((ULONG *)buf)[idx];
+    rdsk->rdb_ChkSum = (LONG)(-(LONG)sum);
+
+    if (!BlockDev_WriteBlock(bd, rdb->block_num, buf)) {
+        es.es_TextFormat   = (UBYTE *)"Failed to write updated RDSK block.";
+        es.es_GadgetFormat = (UBYTE *)"OK";
+        EasyRequest(win, &es, NULL);
+        goto badb_done;
+    }
+
+    ok = TRUE;
+
+badb_done:
+    FreeVec(buf);
+    return ok;
+}
+
+/* ------------------------------------------------------------------ */
+/* bad_block_scan — scan every block on the disk for read failures.   */
+/* Shows a cancellable progress window during the scan, then displays */
+/* results in a scrollable list.  If bad blocks are found and an RDB  */
+/* exists, offers to write a BADB chain.                              */
+/* ------------------------------------------------------------------ */
+
+#define BBSCAN_CANCEL  1
+#define MAX_BAD_BLOCKS 488   /* 8 BADB blocks x 61 entries each */
+
+void bad_block_scan(struct Window *win, struct BlockDev *bd,
+                    struct RDBInfo *rdb)
+{
+    static ULONG  bbl[MAX_BAD_BLOCKS];
+    static char   title_buf[96];
+    UBYTE        *buf        = NULL;
+    ULONG         total_blks = 0;
+    ULONG         bad_count  = 0;
+    ULONG         blk        = 0;
+    BOOL          cancelled  = FALSE;
+    BOOL          capped     = FALSE;
+    char          line[80];
+    struct EasyStruct es;
+
+    es.es_StructSize = sizeof(es);
+    es.es_Flags      = 0;
+    es.es_Title      = (UBYTE *)"Bad Block Scan";
+
+    if (!bd) {
+        es.es_TextFormat   = (UBYTE *)"No device open.";
+        es.es_GadgetFormat = (UBYTE *)"OK";
+        EasyRequest(win, &es, NULL);
+        return;
+    }
+
+    /* Determine total block count */
+    if (bd->total_bytes > 0 && bd->block_size > 0)
+        total_blks = (ULONG)(bd->total_bytes / bd->block_size);
+    if (total_blks == 0 && rdb && rdb->valid)
+        total_blks = rdb->cylinders * rdb->heads * rdb->sectors;
+    if (total_blks == 0) {
+        es.es_TextFormat   = (UBYTE *)"Cannot determine disk size.\nScan not possible.";
+        es.es_GadgetFormat = (UBYTE *)"OK";
+        EasyRequest(win, &es, NULL);
+        return;
+    }
+
+    buf = (UBYTE *)AllocVec(bd->block_size, MEMF_PUBLIC | MEMF_CLEAR);
+    if (!buf) return;
+
+    /* ---- Phase 1: scan with progress window ---- */
+    {
+        struct Screen  *scr       = NULL;
+        APTR            vi        = NULL;
+        struct Gadget  *scan_list = NULL;
+        struct Window  *scan_win  = NULL;
+        UWORD font_h, bor_t, bor_b, bor_l, bor_r, pad, btn_h, win_w, win_h;
+
+        scr = LockPubScreen(NULL);
+        if (scr) {
+            vi = GetVisualInfoA(scr, NULL);
+            if (vi) {
+                struct Gadget *gctx;
+                struct NewGadget ng;
+                struct TagItem bt[] = { { TAG_DONE, 0 } };
+
+                font_h = (UWORD)scr->Font->ta_YSize;
+                bor_t  = (UWORD)scr->WBorTop + font_h + 1;
+                bor_b  = (UWORD)scr->WBorBottom;
+                bor_l  = (UWORD)scr->WBorLeft;
+                bor_r  = (UWORD)scr->WBorRight;
+                pad    = 4;
+                btn_h  = font_h + 6;
+                win_w  = 360;
+                win_h  = (UWORD)(bor_t + pad + btn_h + pad + bor_b);
+
+                memset(&ng, 0, sizeof(ng));
+                ng.ng_VisualInfo = vi;
+                ng.ng_TextAttr   = scr->Font;
+                ng.ng_LeftEdge   = (WORD)(bor_l + pad);
+                ng.ng_TopEdge    = (WORD)(bor_t + pad);
+                ng.ng_Width      = (WORD)(win_w - bor_l - bor_r - pad * 2);
+                ng.ng_Height     = btn_h;
+                ng.ng_GadgetText = "Cancel";
+                ng.ng_GadgetID   = BBSCAN_CANCEL;
+                ng.ng_Flags      = PLACETEXT_IN;
+
+                gctx = CreateContext(&scan_list);
+                if (gctx && CreateGadgetA(BUTTON_KIND, gctx, &ng, bt)) {
+                    struct TagItem wt[] = {
+                        { WA_Left,      (ULONG)((scr->Width  - win_w) / 2) },
+                        { WA_Top,       (ULONG)((scr->Height - win_h) / 2) },
+                        { WA_Width,     win_w }, { WA_Height, win_h },
+                        { WA_Title,     (ULONG)"Bad Block Scan" },
+                        { WA_Gadgets,   (ULONG)scan_list },
+                        { WA_PubScreen, (ULONG)scr },
+                        { WA_IDCMP,     IDCMP_CLOSEWINDOW | IDCMP_GADGETUP |
+                                        IDCMP_REFRESHWINDOW },
+                        { WA_Flags,     WFLG_DRAGBAR | WFLG_DEPTHGADGET |
+                                        WFLG_CLOSEGADGET | WFLG_ACTIVATE |
+                                        WFLG_SIMPLE_REFRESH },
+                        { TAG_DONE, 0 }
+                    };
+                    scan_win = OpenWindowTagList(NULL, wt);
+                }
+                if (!scan_win) { FreeGadgets(scan_list); scan_list = NULL;
+                                 FreeVisualInfo(vi);     vi        = NULL; }
+            }
+            UnlockPubScreen(NULL, scr); scr = NULL;
+        }
+        if (scan_win) GT_RefreshWindow(scan_win, NULL);
+
+        /* Scan loop — polls scan_win for cancel between every block read. */
+        for (blk = 0; blk < total_blks && !cancelled; blk++) {
+            if (scan_win) {
+                struct IntuiMessage *imsg;
+                while ((imsg = GT_GetIMsg(scan_win->UserPort)) != NULL) {
+                    ULONG  iclass = imsg->Class;
+                    struct Gadget *gad = (struct Gadget *)imsg->IAddress;
+                    GT_ReplyIMsg(imsg);
+                    if (iclass == IDCMP_GADGETUP && gad->GadgetID == BBSCAN_CANCEL)
+                        cancelled = TRUE;
+                    if (iclass == IDCMP_CLOSEWINDOW)
+                        cancelled = TRUE;
+                    if (iclass == IDCMP_REFRESHWINDOW) {
+                        GT_BeginRefresh(scan_win);
+                        GT_EndRefresh(scan_win, TRUE);
+                    }
+                }
+            }
+            if (cancelled) break;
+
+            if (!BlockDev_ReadBlock(bd, blk, buf)) {
+                if (!capped) {
+                    if (bad_count < MAX_BAD_BLOCKS)
+                        bbl[bad_count++] = blk;
+                    else
+                        capped = TRUE;
+                }
+            }
+
+            /* Update title every 1000 blocks */
+            if (scan_win && (blk % 1000 == 0)) {
+                ULONG pct = blk * 100UL / total_blks;
+                sprintf(title_buf, "Bad Block Scan - %lu/%lu (%lu%%) Bad:%lu",
+                        (unsigned long)(blk + 1), (unsigned long)total_blks,
+                        (unsigned long)pct, (unsigned long)bad_count);
+                SetWindowTitles(scan_win, title_buf, (UBYTE *)-1L);
+            }
+        }
+
+        if (scan_win)  { RemoveGList(scan_win, scan_list, -1); CloseWindow(scan_win); }
+        if (scan_list)   FreeGadgets(scan_list);
+        if (vi)          FreeVisualInfo(vi);
+    }
+
+    FreeVec(buf); buf = NULL;
+
+    /* ---- Phase 2: show results ---- */
+    vrdb_count = 0;
+    vrdb_list.lh_Head     = (struct Node *)&vrdb_list.lh_Tail;
+    vrdb_list.lh_Tail     = NULL;
+    vrdb_list.lh_TailPred = (struct Node *)&vrdb_list.lh_Head;
+
+    vrdb_add("=== Bad Block Scan Results ===");
+    if (bd->disk_brand[0]) {
+        sprintf(line, "  Drive: %s", bd->disk_brand);
+        vrdb_add(line);
+    }
+    sprintf(line, "  Blocks scanned: %lu%s",
+            (unsigned long)blk,
+            cancelled ? " (cancelled)" : "");
+    vrdb_add(line);
+    sprintf(line, "  Bad blocks found: %lu%s",
+            (unsigned long)bad_count,
+            capped ? " (limit reached, more may exist)" : "");
+    vrdb_add(line);
+    vrdb_add("");
+
+    if (bad_count == 0 && !cancelled) {
+        vrdb_add("  No bad blocks found. Disk surface appears healthy.");
+    } else if (bad_count > 0) {
+        ULONG i;
+        vrdb_add("  Bad block list:");
+        for (i = 0; i < bad_count; i++) {
+            sprintf(line, "    %lu  (0x%08lX)",
+                    (unsigned long)bbl[i], (unsigned long)bbl[i]);
+            vrdb_add(line);
+        }
+        if (capped)
+            vrdb_add("    ... (more bad blocks exist - limit reached)");
+    }
+
+    {
+        struct Screen *scr   = NULL;
+        APTR           vi    = NULL;
+        struct Gadget *glist = NULL;
+        struct Window *vwin  = NULL;
+        UWORD font_h, bor_t, bor_b, pad, row_h, btn_h, win_w, win_h, min_h, scr_w, scr_h;
+
+        scr = LockPubScreen(NULL);
+        if (!scr) goto bbs_no_vrdb;
+        vi = GetVisualInfoA(scr, NULL);
+        if (!vi) { UnlockPubScreen(NULL, scr); goto bbs_no_vrdb; }
+
+        font_h = scr->Font->ta_YSize;
+        bor_t  = scr->WBorTop + font_h + 1;
+        bor_b  = scr->WBorBottom;
+        pad    = 4;
+        row_h  = font_h + 2;
+        btn_h  = font_h + 6;
+        win_w  = 480;
+        win_h  = bor_t + pad + row_h * 20 + pad + btn_h + pad + bor_b;
+        min_h  = bor_t + pad + row_h *  4 + pad + btn_h + pad + bor_b;
+        scr_w  = scr->Width;
+        scr_h  = scr->Height;
+
+        if (!vrdb_make_gadgets(vi, scr, win_w, win_h, &glist))
+            goto bbs_win_cleanup;
+
+        { struct TagItem wt[] = {
+              { WA_Left,      (ULONG)((scr_w - win_w) / 2) },
+              { WA_Top,       (ULONG)((scr_h - win_h) / 2) },
+              { WA_Width,     win_w }, { WA_Height, win_h },
+              { WA_Title,     (ULONG)"Bad Block Scan Results" },
+              { WA_Gadgets,   (ULONG)glist },
+              { WA_PubScreen, (ULONG)scr },
+              { WA_IDCMP,     IDCMP_CLOSEWINDOW | IDCMP_GADGETUP |
+                              IDCMP_NEWSIZE | IDCMP_REFRESHWINDOW },
+              { WA_Flags,     WFLG_DRAGBAR | WFLG_DEPTHGADGET |
+                              WFLG_CLOSEGADGET | WFLG_ACTIVATE | WFLG_SIMPLE_REFRESH |
+                              WFLG_SIZEGADGET | WFLG_SIZEBBOTTOM },
+              { WA_MinWidth,  300 }, { WA_MinHeight, min_h },
+              { WA_MaxWidth,  scr_w }, { WA_MaxHeight, scr_h },
+              { TAG_DONE, 0 } };
+          vwin = OpenWindowTagList(NULL, wt); }
+
+        UnlockPubScreen(NULL, scr); scr = NULL;
+        if (!vwin) goto bbs_win_cleanup;
+        GT_RefreshWindow(vwin, NULL);
+
+        { BOOL running = TRUE;
+          while (running) {
+              struct IntuiMessage *imsg;
+              WaitPort(vwin->UserPort);
+              while ((imsg = GT_GetIMsg(vwin->UserPort)) != NULL) {
+                  ULONG  iclass = imsg->Class;
+                  struct Gadget *gad = (struct Gadget *)imsg->IAddress;
+                  GT_ReplyIMsg(imsg);
+                  switch (iclass) {
+                  case IDCMP_CLOSEWINDOW: running = FALSE; break;
+                  case IDCMP_NEWSIZE: {
+                      struct Gadget *ng2 = NULL;
+                      RemoveGList(vwin, glist, -1);
+                      FreeGadgets(glist); glist = NULL;
+                      if (vrdb_make_gadgets(vi, vwin->WScreen,
+                                            (UWORD)vwin->Width, (UWORD)vwin->Height, &ng2)) {
+                          glist = ng2;
+                          AddGList(vwin, glist, ~0, -1, NULL);
+                          RefreshGList(glist, vwin, NULL, -1);
+                      }
+                      GT_RefreshWindow(vwin, NULL);
+                      break; }
+                  case IDCMP_GADGETUP:
+                      if (gad->GadgetID == VRDB_DONE) running = FALSE; break;
+                  case IDCMP_REFRESHWINDOW:
+                      GT_BeginRefresh(vwin); GT_EndRefresh(vwin, TRUE); break;
+                  }
+              }
+          }
+        }
+
+bbs_win_cleanup:
+        if (vwin)  { RemoveGList(vwin, glist, -1); CloseWindow(vwin); }
+        if (glist)   FreeGadgets(glist);
+        if (vi)      FreeVisualInfo(vi);
+        if (scr)     UnlockPubScreen(NULL, scr);
+    }
+
+bbs_no_vrdb:
+    /* ---- Phase 3: offer BADB write if bad blocks found and RDB exists ---- */
+    if (bad_count > 0 && !cancelled && rdb && rdb->valid) {
+        LONG r;
+        static char badb_msg[160];
+        sprintf(badb_msg,
+                "%lu bad block(s) found.\n"
+                "Write bad block list to RDB?\n\n"
+                "Note: entries will be cleared if\n"
+                "you write the partition table later.",
+                (unsigned long)bad_count);
+        es.es_TextFormat   = (UBYTE *)badb_msg;
+        es.es_GadgetFormat = (UBYTE *)"Write|Skip";
+        r = EasyRequest(win, &es, NULL);
+        if (r == 1) {
+            if (write_badb(win, bd, rdb, bbl, bad_count)) {
+                es.es_TextFormat   = (UBYTE *)"Bad block list written to RDB.";
+                es.es_GadgetFormat = (UBYTE *)"OK";
+                EasyRequest(win, &es, NULL);
+            }
+        }
+    }
+}

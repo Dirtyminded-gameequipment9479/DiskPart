@@ -48,12 +48,14 @@ struct BlockDev {
     UQUAD            total_bytes;   /* total disk capacity            */
     char             devname[64];
     ULONG            unit;
-    BYTE             last_io_err;       /* io_Error from last WriteBlock call */
-    ULONG            last_verify_block; /* block number that failed verify    */
-    ULONG            last_verify_off;   /* byte offset of first mismatch      */
-    UBYTE            last_wrote[4];     /* bytes at mismatch offset, written  */
-    UBYTE            last_read[4];      /* bytes at mismatch offset, on disk  */
-    char             disk_brand[36];    /* vendor+product from SCSI INQUIRY   */
+    BYTE             last_io_err;         /* io_Error from last WriteBlock call  */
+    ULONG            last_verify_block;   /* block number that failed verify     */
+    ULONG            last_verify_off;     /* byte offset of first mismatch       */
+    UBYTE            last_wrote[4];       /* bytes at mismatch offset, written   */
+    UBYTE            last_read[4];        /* bytes at mismatch offset, on disk   */
+    char             disk_brand[36];      /* vendor+product from SCSI INQUIRY    */
+    ULONG            last_overflow_need;  /* blocks needed  (set on overflow)    */
+    ULONG            last_overflow_avail; /* blocks available (set on overflow)  */
 };
 
 /* Open/close a block device for probing or RDB I/O. */
@@ -63,6 +65,15 @@ void             BlockDev_Close(struct BlockDev *bd);
 /* Read/write a single block. */
 BOOL             BlockDev_ReadBlock(struct BlockDev *bd, ULONG blocknum, void *buf);
 BOOL             BlockDev_WriteBlock(struct BlockDev *bd, ULONG blocknum, const void *buf);
+
+/*
+ * Query physical geometry from the driver (TD_GETGEOMETRY).
+ * Returns FALSE if the driver does not respond or reports zero sectors.
+ * Applies sensible defaults (heads=16, sectors=63) when driver returns 0.
+ * cyls is derived from dg_Cylinders when non-zero, else from total/h/s.
+ */
+BOOL             BlockDev_GetGeometry(struct BlockDev *bd,
+                                      ULONG *cyls, ULONG *heads, ULONG *sectors);
 
 /* Returns TRUE if block 0 has a PC MBR signature (0x55AA at offset 510). */
 BOOL             BlockDev_HasMBR(struct BlockDev *bd);

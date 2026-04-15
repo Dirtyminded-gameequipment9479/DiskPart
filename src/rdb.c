@@ -291,6 +291,34 @@ BOOL BlockDev_WriteBlock(struct BlockDev *bd, ULONG blocknum, const void *buf)
 }
 
 /* ------------------------------------------------------------------ */
+/* BlockDev_GetGeometry                                                */
+/* ------------------------------------------------------------------ */
+
+BOOL BlockDev_GetGeometry(struct BlockDev *bd,
+                          ULONG *cyls, ULONG *heads, ULONG *sectors)
+{
+    struct DriveGeometry geom;
+
+    memset(&geom, 0, sizeof(geom));
+    bd->iotd.iotd_Req.io_Command = TD_GETGEOMETRY;
+    bd->iotd.iotd_Req.io_Length  = sizeof(geom);
+    bd->iotd.iotd_Req.io_Data    = (APTR)&geom;
+    bd->iotd.iotd_Req.io_Flags   = 0;
+    if (DoIO((struct IORequest *)&bd->iotd) != 0) return FALSE;
+    if (geom.dg_TotalSectors == 0)                return FALSE;
+
+    *heads   = (geom.dg_Heads        > 0) ? geom.dg_Heads        : 16;
+    *sectors = (geom.dg_TrackSectors > 0) ? geom.dg_TrackSectors : 63;
+
+    if (geom.dg_Cylinders > 0)
+        *cyls = geom.dg_Cylinders;
+    else
+        *cyls = geom.dg_TotalSectors / (*heads * *sectors);
+
+    return (*cyls > 0);
+}
+
+/* ------------------------------------------------------------------ */
 /* BlockDev_HasMBR                                                     */
 /* ------------------------------------------------------------------ */
 
@@ -724,7 +752,18 @@ void RDB_InitFresh(struct RDBInfo *rdb,
     rdb->block_num    = 0;
     rdb->rdb_block_lo = 0;
     rdb->rdb_block_hi = 15;   /* reserve first 16 blocks (RDB_LOCATION_LIMIT) */
-    rdb->lo_cyl       = 1;    /* cylinder 0 holds RDB metadata */
+    /* Reserve enough cylinders for ~256 KB of filesystem driver code plus
+       overhead (RDB + partition blocks + FSHD headers).
+       target = ceil((1 + MAX_PARTITIONS + MAX_FILESYSTEMS + 533 LSEG) / blks_per_cyl)
+              = ceil(630 / blks_per_cyl), minimum 1.
+       On a large-geometry disk (heads=16, sectors=63 → 1008 blks/cyl) this
+       still gives lo_cyl=1; on a small-geometry disk it reserves more. */
+    {
+        ULONG blks_per_cyl = heads * sectors;   /* both are >= 1 after clamping */
+        ULONG target       = 1UL + MAX_PARTITIONS + MAX_FILESYSTEMS + 533UL; /* ~630 */
+        rdb->lo_cyl = (ULONG)((target + blks_per_cyl - 1) / blks_per_cyl);
+        if (rdb->lo_cyl < 1) rdb->lo_cyl = 1;
+    }
     rdb->hi_cyl       = cylinders - 1;
     rdb->part_list    = RDB_END_MARK;
     rdb->fshdr_list   = RDB_END_MARK;
@@ -829,7 +868,10 @@ BOOL RDB_Write(struct BlockDev *bd, struct RDBInfo *rdb)
     if (rdb->heads > 0 && rdb->sectors > 0 && rdb->lo_cyl > 0) {
         ULONG reserved_end = rdb->lo_cyl * rdb->heads * rdb->sectors;
         if (last_used_blk >= reserved_end) {
-            /* Do not write anything — return FALSE so caller can report. */
+            /* Store the actual numbers so the caller can show a useful message. */
+            bd->last_overflow_need  = last_used_blk + 1;
+            bd->last_overflow_avail = reserved_end;
+            bd->last_io_err = 0;
             return FALSE;
         }
     }

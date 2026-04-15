@@ -101,6 +101,23 @@ static const UBYTE PART_B[NUM_PART_COLORS]={0xD9,0x22,0x60,0xAD,0x3C,0x85,0x12,0
 #define C32(b) (((ULONG)(b)<<24)|((ULONG)(b)<<16)|((ULONG)(b)<<8)|(ULONG)(b))
 
 /* ------------------------------------------------------------------ */
+/* Custom resize pointer sprite — shown when hovering over the map.   */
+/* White ↔ arrow, 16px wide × 7 rows.  Hotspot at col 7, row 3.      */
+/* Must be copied to chip RAM before use (see partview_run).          */
+/* ------------------------------------------------------------------ */
+
+static const UWORD ptr_resize_src[] = {
+    0x0000, 0x0000,   /* row 0: blank */
+    0x2004, 0x0000,   /* row 1: arrowhead tips */
+    0x6006, 0x0000,   /* row 2: arrowhead inner */
+    0xFFFE, 0x0000,   /* row 3: shaft (hotspot row) */
+    0x6006, 0x0000,   /* row 4: arrowhead inner */
+    0x2004, 0x0000,   /* row 5: arrowhead tips */
+    0x0000, 0x0000,   /* row 6: blank */
+    0x0000, 0x0000,   /* terminator */
+};
+
+/* ------------------------------------------------------------------ */
 /* Partition listview — proportional-font column renderer              */
 /* ------------------------------------------------------------------ */
 
@@ -196,6 +213,21 @@ static ULONG lv_render(void)
                       (WORD)lv_cols[(col)].w - _tw); \
     Move(rp, _rx, base_y); \
     Text(rp, (str), (UWORD)(len)); } while(0)
+
+    /* Column dividers — vertical line centred in the 6px gap before each
+       column from LOCYL onwards.  Drawn before text so glyphs overlay them. */
+    {
+        UWORD dc;
+        SetAPen(rp, (LONG)msg->lvdm_DrawInfo->dri_Pens[SHADOWPEN]);
+        SetDrMd(rp, JAM1);
+        for (dc = LVCOL_LOCYL; dc < LVCOL_COUNT; dc++) {
+            WORD dx = b->MinX + (WORD)lv_cols[dc].x - 3;
+            if (dx <= b->MinX || dx >= b->MaxX) continue;
+            Move(rp, dx, b->MinY);
+            Draw(rp, dx, b->MaxY);
+        }
+        SetAPen(rp, (LONG)fg_pen);
+    }
 
     /* Selection marker */
     if (sel) { tmp[0] = '>'; LV_TEXT(LVCOL_MARK, tmp, 1); }
@@ -499,6 +531,12 @@ static void draw_map(struct Window *win, struct RDBInfo *rdb, WORD sel,
             sprintf(lo_str, "Cyl %lu", (unsigned long)lo);
             sprintf(hi_str, "Cyl %lu", (unsigned long)hi);
 
+            /* Erase the label strip before redrawing — prevents ghost text
+               when the map is redrawn at a different position after resize. */
+            SetAPen(rp, 0);
+            SetDrMd(rp, JAM2);
+            RectFill(rp, bx, by+(WORD)bh+1, bx+(WORD)bw, by+(WORD)bh+fh+4);
+
             SetAPen(rp, 1);
             SetDrMd(rp, JAM1);
             Move(rp, bx, label_y);
@@ -510,6 +548,21 @@ static void draw_map(struct Window *win, struct RDBInfo *rdb, WORD sel,
                 WORD  htw  = (WORD)(hlen * (UWORD)txw);
                 Move(rp, bx+(WORD)bw-htw, label_y);
                 Text(rp, hi_str, hlen);
+
+                /* Centred usage hint — only if it fits between the Cyl labels */
+                {
+                    static const char hint[] =
+                        "drag edges to resize  \xB7  drag body to move  \xB7  drag free area to add";
+                    UWORD hintlen = strlen(hint);
+                    WORD  hinttw  = (WORD)TextLength(rp, hint, hintlen);
+                    WORD  lo_end  = (WORD)TextLength(rp, lo_str, (UWORD)strlen(lo_str)) + 4;
+                    WORD  avail   = (WORD)bw - lo_end - htw - 8;
+                    if (hinttw <= avail) {
+                        WORD cx = bx + lo_end + (avail - hinttw) / 2;
+                        Move(rp, cx, label_y);
+                        Text(rp, hint, hintlen);
+                    }
+                }
             }
         }
     }
@@ -784,6 +837,14 @@ static void draw_col_header(struct Window *win, WORD hx, WORD hy, UWORD hw)
         Move(rp, lx, hy + fb);
         Text(rp, label, llen);
     }
+
+    /* Divider lines — same positions as in lv_render, pen 1 on dark header */
+    for (i = LVCOL_LOCYL; i < LVCOL_COUNT; i++) {
+        WORD dx = hx + (WORD)lv_cols[i].x - 3;
+        if (dx <= hx || dx >= hx + (WORD)hw - 1) continue;
+        Move(rp, dx, hy);
+        Draw(rp, dx, hy + fh + 1);
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -824,9 +885,22 @@ static void refresh_listview(struct Window *win, struct Gadget *lv_gad,
 /* Free cylinder range                                                 */
 /* ------------------------------------------------------------------ */
 
+/* Case-insensitive string compare (returns TRUE if equal). */
+static BOOL name_eq(const char *a, const char *b)
+{
+    for (;;) {
+        char ca = *a++, cb = *b++;
+        if (ca >= 'a' && ca <= 'z') ca = (char)(ca - 32);
+        if (cb >= 'a' && cb <= 'z') cb = (char)(cb - 32);
+        if (ca != cb) return FALSE;
+        if (ca == '\0') return TRUE;
+    }
+}
+
 /* Find the lowest N such that "DH<N>" is not already used by any partition
-   in this RDB. Comparison is case-insensitive (AmigaOS names are uppercase
-   by convention but guard against mixed-case entries). */
+   in this RDB *and* is not already present in the AmigaOS DosList.
+   Checking the DosList avoids suggesting e.g. DH0 when another disk
+   already has a DH0: device mounted. */
 static void next_drive_name(const struct RDBInfo *rdb, char *buf)
 {
     ULONG n;
@@ -834,20 +908,31 @@ static void next_drive_name(const struct RDBInfo *rdb, char *buf)
         UWORD k;
         BOOL  taken = FALSE;
         char  cand[8];
-        UWORD ci;
         sprintf(cand, "DH%lu", n);
-        for (k = 0; k < rdb->num_parts; k++) {
-            const char *ex = rdb->parts[k].drive_name;
-            /* Case-insensitive compare */
-            for (ci = 0; ; ci++) {
-                char a = cand[ci], b = ex[ci];
-                if (a >= 'a' && a <= 'z') a = (char)(a - 32);
-                if (b >= 'a' && b <= 'z') b = (char)(b - 32);
-                if (a != b) break;
-                if (a == '\0') { taken = TRUE; break; }
+
+        /* Check partitions already in this RDB */
+        for (k = 0; k < rdb->num_parts && !taken; k++)
+            if (name_eq(cand, rdb->parts[k].drive_name))
+                taken = TRUE;
+
+        /* Check AmigaOS DosList (mounted devices from all other disks) */
+        if (!taken) {
+            struct DosList *dl = LockDosList(LDF_DEVICES | LDF_READ);
+            while ((dl = NextDosEntry(dl, LDF_DEVICES)) != NULL) {
+                /* dol_Name is a BSTR: BADDR gives ptr where byte 0 is
+                   the length and bytes 1..len are the name. */
+                const UBYTE *bs = (const UBYTE *)BADDR(dl->dol_Name);
+                UBYTE        len = bs[0];
+                char         tmp[32];
+                UBYTE        i;
+                if (len >= sizeof(tmp)) len = (UBYTE)(sizeof(tmp) - 1);
+                for (i = 0; i < len; i++) tmp[i] = (char)bs[i + 1];
+                tmp[len] = '\0';
+                if (name_eq(cand, tmp)) { taken = TRUE; break; }
             }
-            if (taken) break;
+            UnLockDosList(LDF_DEVICES | LDF_READ);
         }
+
         if (!taken) { strncpy(buf, cand, 31); buf[31] = '\0'; return; }
     }
     strncpy(buf, "DH0", 31);   /* fallback, shouldn't happen */
@@ -1162,7 +1247,11 @@ static struct NewMenu partview_menu_def[] = {
     { NM_ITEM,  NM_BARLABEL,             NULL,         0, 0, NULL },  /* ITEM 2 */
     { NM_ITEM,  "Extended Backup...",    NULL,         0, 0, NULL },  /* ITEM 3 */
     { NM_ITEM,  "Extended Restore...",   NULL,         0, 0, NULL },  /* ITEM 4 */
-    /* Menu 2 — Debug: low-level inspection tools */
+    /* Menu 2 — Health: disk diagnostics */
+    { NM_TITLE, "Health",                NULL,         0, 0, NULL },
+    { NM_ITEM,  "SMART Status",          NULL,         0, 0, NULL },  /* ITEM 0 */
+    { NM_ITEM,  "Bad Block Scan...",     NULL,         0, 0, NULL },  /* ITEM 1 */
+    /* Menu 3 — Debug: low-level inspection tools */
     { NM_TITLE, "Debug",                 NULL,         0, 0, NULL },
     { NM_ITEM,  "View RDB Block",        NULL,         0, 0, NULL },  /* ITEM 0 */
     { NM_ITEM,  "Raw Block Scan...",     NULL,         0, 0, NULL },  /* ITEM 1 */
@@ -1197,8 +1286,12 @@ BOOL partview_run(const char *devname, ULONG unit)
     BOOL              needs_reboot = FALSE;  /* partition layout changed */
     BOOL              exit_req     = FALSE;
     WORD              i;
-    static char       wfmt[128];            /* formatted write-fail message — static: off stack */
+    static char       wfmt[512];            /* formatted write-fail message — static: off stack */
     static char       win_title[80];
+
+    /* Custom pointer — chip RAM copy of ptr_resize_src, NULL if alloc failed */
+    UWORD            *ptr_chip   = NULL;
+    BOOL              ptr_custom = FALSE;   /* TRUE while SetPointer is active */
 
     /* Drag resize state */
     WORD  drag_part    = -1;   /* -1 = not dragging */
@@ -1396,6 +1489,11 @@ BOOL partview_run(const char *devname, ULONG unit)
         }
     }
 
+    /* Allocate chip RAM copy of the resize pointer sprite */
+    ptr_chip = (UWORD *)AllocVec(sizeof(ptr_resize_src), MEMF_CHIP);
+    if (ptr_chip)
+        CopyMem((APTR)ptr_resize_src, (APTR)ptr_chip, sizeof(ptr_resize_src));
+
     GT_RefreshWindow(win, NULL);
     draw_static(win, devname, unit, rdb, (bd ? bd->disk_brand : ""),
                 ix, iy, iw, bx, by, bw, bh, hx, hy, hw, sel, lastdisk_gad, lastlun_gad);
@@ -1435,16 +1533,21 @@ BOOL partview_run(const char *devname, ULONG unit)
                             rdb_backup_extended(win, bd, rdb);
                         else if (MENUNUM(mcode) == 1 && ITEMNUM(mcode) == 4)
                             rdb_restore_extended(win, bd);
-                        /* Debug menu */
+                        /* Health menu */
                         else if (MENUNUM(mcode) == 2 && ITEMNUM(mcode) == 0)
-                            rdb_view_block(win, bd, rdb);
+                            smart_status(win, bd);
                         else if (MENUNUM(mcode) == 2 && ITEMNUM(mcode) == 1)
+                            bad_block_scan(win, bd, rdb);
+                        /* Debug menu */
+                        else if (MENUNUM(mcode) == 3 && ITEMNUM(mcode) == 0)
+                            rdb_view_block(win, bd, rdb);
+                        else if (MENUNUM(mcode) == 3 && ITEMNUM(mcode) == 1)
                             rdb_raw_scan(win, bd);
-                        else if (MENUNUM(mcode) == 2 && ITEMNUM(mcode) == 2)
+                        else if (MENUNUM(mcode) == 3 && ITEMNUM(mcode) == 2)
                             raw_hex_dump(win, bd);
-                        else if (MENUNUM(mcode) == 2 && ITEMNUM(mcode) == 4)
+                        else if (MENUNUM(mcode) == 3 && ITEMNUM(mcode) == 4)
                             raw_disk_read(win, bd);
-                        else if (MENUNUM(mcode) == 2 && ITEMNUM(mcode) == 6)
+                        else if (MENUNUM(mcode) == 3 && ITEMNUM(mcode) == 6)
                             check_ffs_root(win, bd, rdb, sel);
                         mcode = it->NextSelect;
                     }
@@ -1812,6 +1915,20 @@ BOOL partview_run(const char *devname, ULONG unit)
                         draw_map(win, rdb, sel, bx, by, bw, bh);
                         draw_new_part_overlay(win, drag_new_lo, drag_new_hi,
                                               rdb, bx, by, bw, bh);
+                    } else {
+                        /* Idle hover — update pointer when entering/leaving map */
+                        if (ptr_chip) {
+                            BOOL in_map = (rdb && rdb->valid &&
+                                           mouse_x >= bx && mouse_x < bx + (WORD)bw &&
+                                           mouse_y >= by && mouse_y < by + (WORD)bh);
+                            if (in_map && !ptr_custom) {
+                                SetPointer(win, ptr_chip, 7, 16, 7, 3);
+                                ptr_custom = TRUE;
+                            } else if (!in_map && ptr_custom) {
+                                ClearPointer(win);
+                                ptr_custom = FALSE;
+                            }
+                        }
                     }
                     break;
 
@@ -2126,51 +2243,115 @@ BOOL partview_run(const char *devname, ULONG unit)
 
                     case GID_WRITE: {
                         struct EasyStruct es;
+                        BOOL write_ok;
                         es.es_StructSize   = sizeof(es);
                         es.es_Flags        = 0;
                         es.es_Title        = (UBYTE *)DISKPART_VERTITLE;
                         es.es_TextFormat   = (UBYTE *)"Write partition table to disk?\nAll existing data may be lost!";
                         es.es_GadgetFormat = (UBYTE *)"Write|Cancel";
-                        if (EasyRequest(win, &es, NULL) == 1) {
-                            if (!bd || !RDB_Write(bd, rdb)) {
-                                if (bd && bd->last_io_err == 1)
-                                    sprintf(wfmt,
-                                        "Verify fail blk %lu off %lu\n"
-                                        "W:%02X%02X%02X%02X R:%02X%02X%02X%02X",
-                                        (unsigned long)bd->last_verify_block,
-                                        (unsigned long)bd->last_verify_off,
-                                        bd->last_wrote[0], bd->last_wrote[1],
-                                        bd->last_wrote[2], bd->last_wrote[3],
-                                        bd->last_read[0],  bd->last_read[1],
-                                        bd->last_read[2],  bd->last_read[3]);
-                                else if (bd && bd->last_io_err == 0)
-                                    sprintf(wfmt,
-                                        "Write rejected: RDB metadata (%lu blocks)\n"
-                                        "would overflow the reserved area.\n"
-                                        "Remove filesystem drivers to free space.",
-                                        (unsigned long)rdb->num_fs);
-                                else
-                                    sprintf(wfmt, "Write failed (err %d)!\nCheck device and try again.",
-                                        bd ? (int)bd->last_io_err : 0);
+                        if (EasyRequest(win, &es, NULL) != 1) break;
+
+                        write_ok = (bd != NULL) && RDB_Write(bd, rdb);
+
+                        if (!write_ok && bd && bd->last_io_err == 0) {
+                            /* Metadata overflow — try to offer a lo_cyl increase */
+                            ULONG blks_per_cyl = rdb->heads * rdb->sectors;
+                            ULONG new_lo       = (blks_per_cyl > 0)
+                                ? (bd->last_overflow_need + blks_per_cyl - 1) / blks_per_cyl
+                                : 0;
+                            WORD  blk_part     = -1;
+                            UWORD j;
+
+                            for (j = 0; j < rdb->num_parts; j++) {
+                                if (new_lo > 0 && rdb->parts[j].low_cyl < new_lo) {
+                                    blk_part = (WORD)j; break;
+                                }
+                            }
+
+                            if (new_lo > rdb->lo_cyl && blk_part < 0) {
+                                /* Safe: no partition starts inside the new reserved area */
+                                sprintf(wfmt,
+                                    "Metadata overflow:\n"
+                                    "need %lu blocks, only %lu available\n"
+                                    "(lo_cyl=%lu, %lu blks/cyl).\n\n"
+                                    "Increase reserved area to lo_cyl=%lu\n"
+                                    "and write now?",
+                                    (unsigned long)bd->last_overflow_need,
+                                    (unsigned long)bd->last_overflow_avail,
+                                    (unsigned long)rdb->lo_cyl,
+                                    (unsigned long)blks_per_cyl,
+                                    (unsigned long)new_lo);
+                                es.es_TextFormat   = (UBYTE *)wfmt;
+                                es.es_GadgetFormat = (UBYTE *)"Increase & Write|Cancel";
+                                if (EasyRequest(win, &es, NULL) == 1) {
+                                    rdb->lo_cyl = new_lo;
+                                    dirty       = TRUE;
+                                    write_ok    = RDB_Write(bd, rdb);
+                                    if (!write_ok) {
+                                        sprintf(wfmt, "Write failed after lo_cyl increase (err %d).",
+                                            (int)bd->last_io_err);
+                                        es.es_TextFormat   = (UBYTE *)wfmt;
+                                        es.es_GadgetFormat = (UBYTE *)"OK";
+                                        EasyRequest(win, &es, NULL);
+                                    }
+                                }
+                            } else if (blk_part >= 0) {
+                                /* A partition blocks the expansion */
+                                sprintf(wfmt,
+                                    "Metadata overflow: need lo_cyl=%lu,\n"
+                                    "but %s starts at cyl %lu.\n\n"
+                                    "Move %s to cyl %lu or later first.",
+                                    (unsigned long)new_lo,
+                                    rdb->parts[blk_part].drive_name,
+                                    (unsigned long)rdb->parts[blk_part].low_cyl,
+                                    rdb->parts[blk_part].drive_name,
+                                    (unsigned long)new_lo);
                                 es.es_TextFormat   = (UBYTE *)wfmt;
                                 es.es_GadgetFormat = (UBYTE *)"OK";
                                 EasyRequest(win, &es, NULL);
                             } else {
-                                dirty = FALSE;
-                                if (BlockDev_HasMBR(bd)) {
-                                    es.es_TextFormat   = (UBYTE *)"PC partition table (MBR) found on block 0.\nErase it?";
-                                    es.es_GadgetFormat = (UBYTE *)"Erase|Keep";
-                                    if (EasyRequest(win, &es, NULL) == 1)
-                                        BlockDev_EraseMBR(bd);
-                                }
-                                if (needs_reboot) {
-                                    es.es_TextFormat   = (UBYTE *)"Partition table written.\nReboot now for changes to take effect.";
-                                    es.es_GadgetFormat = (UBYTE *)"Reboot|Later";
-                                    if (EasyRequest(win, &es, NULL) == 1)
-                                        ColdReboot();
-                                    else
-                                        needs_reboot = FALSE;
-                                }
+                                sprintf(wfmt, "Metadata overflow: need %lu blocks, "
+                                    "only %lu available.",
+                                    (unsigned long)bd->last_overflow_need,
+                                    (unsigned long)bd->last_overflow_avail);
+                                es.es_TextFormat   = (UBYTE *)wfmt;
+                                es.es_GadgetFormat = (UBYTE *)"OK";
+                                EasyRequest(win, &es, NULL);
+                            }
+                        } else if (!write_ok) {
+                            if (bd && bd->last_io_err == 1)
+                                sprintf(wfmt,
+                                    "Verify fail blk %lu off %lu\n"
+                                    "W:%02X%02X%02X%02X R:%02X%02X%02X%02X",
+                                    (unsigned long)bd->last_verify_block,
+                                    (unsigned long)bd->last_verify_off,
+                                    bd->last_wrote[0], bd->last_wrote[1],
+                                    bd->last_wrote[2], bd->last_wrote[3],
+                                    bd->last_read[0],  bd->last_read[1],
+                                    bd->last_read[2],  bd->last_read[3]);
+                            else
+                                sprintf(wfmt, "Write failed (err %d)!\nCheck device and try again.",
+                                    bd ? (int)bd->last_io_err : 0);
+                            es.es_TextFormat   = (UBYTE *)wfmt;
+                            es.es_GadgetFormat = (UBYTE *)"OK";
+                            EasyRequest(win, &es, NULL);
+                        }
+
+                        if (write_ok) {
+                            dirty = FALSE;
+                            if (BlockDev_HasMBR(bd)) {
+                                es.es_TextFormat   = (UBYTE *)"PC partition table (MBR) found on block 0.\nErase it?";
+                                es.es_GadgetFormat = (UBYTE *)"Erase|Keep";
+                                if (EasyRequest(win, &es, NULL) == 1)
+                                    BlockDev_EraseMBR(bd);
+                            }
+                            if (needs_reboot) {
+                                es.es_TextFormat   = (UBYTE *)"Partition table written.\nReboot now for changes to take effect.";
+                                es.es_GadgetFormat = (UBYTE *)"Reboot|Later";
+                                if (EasyRequest(win, &es, NULL) == 1)
+                                    ColdReboot();
+                                else
+                                    needs_reboot = FALSE;
                             }
                         }
                         break;
@@ -2224,10 +2405,21 @@ BOOL partview_run(const char *devname, ULONG unit)
                         drag_part = -1;
                     }
 
+                    /* Reset pointer — map position changes after resize */
+                    if (ptr_custom) { ClearPointer(win); ptr_custom = FALSE; }
+
                     RemoveGList(win, glist, -1);
                     FreeGadgets(glist);
                     glist = NULL; lv_gad = NULL;
                     lastdisk_gad = NULL; lastlun_gad = NULL;
+
+                    /* Erase the window interior so stale gadget imagery
+                       (buttons that moved, old Cyl labels, etc.) is gone
+                       before the new layout is drawn. */
+                    EraseRect(win->RPort,
+                              win->BorderLeft,  win->BorderTop,
+                              (WORD)win->Width  - (WORD)win->BorderRight  - 1,
+                              (WORD)win->Height - (WORD)win->BorderBottom - 1);
 
                     if (build_gadgets(vi,
                                       (UWORD)win->Width,  (UWORD)win->Height,
@@ -2278,11 +2470,17 @@ BOOL partview_run(const char *devname, ULONG unit)
     }
 
 cleanup:
-    if (win)   { ClearMenuStrip(win); if (glist) RemoveGList(win, glist, -1); CloseWindow(win); }
-    if (menu)    FreeMenus(menu);
-    if (glist)   FreeGadgets(glist);
-    if (vi)      FreeVisualInfo(vi);
-    if (scr)     UnlockPubScreen(NULL, scr);
+    if (win) {
+        if (ptr_custom) ClearPointer(win);
+        ClearMenuStrip(win);
+        if (glist) RemoveGList(win, glist, -1);
+        CloseWindow(win);
+    }
+    if (ptr_chip)  FreeVec(ptr_chip);
+    if (menu)      FreeMenus(menu);
+    if (glist)     FreeGadgets(glist);
+    if (vi)        FreeVisualInfo(vi);
+    if (scr)       UnlockPubScreen(NULL, scr);
     {
         struct Screen *ws = LockPubScreen(NULL);
         if (ws) { free_pens(ws); UnlockPubScreen(NULL, ws); }

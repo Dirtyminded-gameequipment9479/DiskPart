@@ -1,0 +1,225 @@
+DiskPart CLI Reference
+======================
+
+USAGE
+  DiskPart                        Open GUI (device selector window)
+  DiskPart <command> [options]    Run CLI command, no GUI opened
+
+The same binary is used for both modes.  No arguments = GUI.
+Arguments = CLI (only dos.library is opened; Intuition/GadTools not needed).
+
+Output can be redirected:  DiskPart LISTDEV >ram:devs.txt
+
+RETURN CODES
+  0   RETURN_OK    Command completed successfully
+  5   RETURN_WARN  Usage error (bad or missing argument combination)
+ 10   RETURN_ERROR Runtime error (device open failed, ReadArgs error, etc.)
+ 20   RETURN_FAIL  Fatal error (dos.library could not be opened)
+
+
+COMMANDS
+--------
+
+LISTDEV [UNITS]
+  List all block device drivers found on this system.
+
+  No options: instant scan — walks AmigaDOS DosList and exec DeviceList,
+  no I/O performed.  Shows driver name and version if loaded.
+
+  UNITS: also probe each driver for responding units.  This opens each
+  device in turn (slow — can take several seconds per driver).  Shows
+  the same unit info as the GUI's unit-selection window:
+  unit number, vendor/product string, and disk size.
+
+  Examples:
+    DiskPart LISTDEV
+    DiskPart LISTDEV UNITS
+
+  Sample output (LISTDEV):
+    Block devices: 3
+
+    uae.device               v37.0
+    scsi.device              v37.15
+    ide.device
+
+  Sample output (LISTDEV UNITS):
+    Block devices: 3
+
+    uae.device               v37.0
+      Probing units for uae.device...
+      Unit 0   WDC WD5000AAKS   500 GB (476 MB)
+
+    scsi.device              v37.15
+      Probing units for scsi.device...
+      (no units found)
+
+    ide.device
+      Probing units for ide.device...
+      Unit 0   SAMSUNG SV1604N   160 GB (152 MB)
+
+
+DEV <device>:<unit>
+  Specify the target device and unit for a command.
+  Must be combined with a command (e.g. INIT).
+  Format: device name followed by colon and unit number.
+
+  Example:  DiskPart DEV uaehf.device:3 INIT NEW
+
+INIT NEW
+  Create a fresh RDB on the specified device, auto-detecting geometry
+  from TD_GETGEOMETRY.  Writes immediately (no separate WRITE step
+  needed for this command).
+
+  If an existing RDB is found, a Y/N question is shown before
+  overwriting.  FORCE auto-answers Y to all questions.
+
+  Example:  DiskPart DEV uaehf.device:3 INIT NEW
+            DiskPart DEV uaehf.device:3 INIT NEW FORCE
+
+INIT NEWGEO
+  Update the RDB cylinder count to match the actual disk size.
+  Use after replacing a disk with a larger one (clone + expand).
+  Keeps existing heads/sectors from the RDB; only the cylinder
+  count and hi_cyl are updated.  If the disk is the same size or
+  smaller, reports "no update needed" and exits cleanly.
+
+  A Y/N question is shown before writing.  FORCE auto-answers Y.
+
+  Example:  DiskPart DEV uaehf.device:3 INIT NEWGEO
+            DiskPart DEV uaehf.device:3 INIT NEWGEO FORCE
+
+FORCE
+  Global switch.  Auto-answers Y to all Y/N safety questions.
+  Useful for scripting or when you are certain of the operation.
+
+SCRIPT <file> [DRYRUN] [FORCE]
+  Read and execute commands from a text file, one per line.
+  Comments start with # or ;.  Blank lines are ignored.
+  Commands accumulate changes in memory; only WRITE commits to disk.
+
+  DRYRUN: parse and validate, print what would happen, no writes.
+  FORCE:  suppress all warnings (same as global FORCE flag).
+
+  Example script (ram:setup.txt):
+    # Initialise uaehf.device unit 0
+    OPEN uaehf.device 0
+    INIT NEW
+    ADDPART NAME=DH0 LOW=2 HIGH=511 TYPE=DOS3 BOOTPRI=0
+    ADDPART NAME=DH1 LOW=512 HIGH=1023 TYPE=PDS3
+    ADDFS TYPE=DOS3 FILE=L:pfs3aio
+    WRITE
+
+  Run with:  DiskPart SCRIPT ram:setup.txt
+         or: DiskPart SCRIPT ram:setup.txt DRYRUN
+         or: DiskPart SCRIPT ram:setup.txt FORCE
+
+  See EXAMPLES section at the bottom of this file for a complete
+  disk-preparation script using PFS3.
+
+
+SCRIPT COMMANDS
+---------------
+These commands are only valid inside a script file.
+
+OPEN <device> <unit>
+  Open a block device for subsequent commands.
+  Example:  OPEN uaehf.device 3
+
+INFO
+  Read and display the RDB and partition table.  Read-only.
+
+INIT NEW
+  Create a fresh RDB on the opened device, auto-detecting geometry.
+  Overwrites any existing RDB (warns unless FORCE is set).
+
+INIT NEWGEO
+  Update the RDB cylinder count to match the actual disk size.
+  Keeps existing heads/sectors; only cylinder count and hi_cyl change.
+  No-op if disk is the same size or smaller.
+
+ADDPART NAME=<n> LOW=<cyl|NEXT> HIGH=<cyl|END|+size>
+         [TYPE=<dostype>] [BOOTPRI=<n>] [BOOTABLE]
+  Add a partition entry to the in-memory RDB.
+  TYPE defaults to DOS3 (0x444F5303) if not specified.
+  TYPE can be a hex value (0x444F5303 or $444F5303) or a short
+  DOS-type string: DOS3, PDS3, SFS0, PFS3, etc. (3 chars + digit).
+
+  LOW=START   First available cylinder from the beginning of the usable
+              area (lo_cyl), skipping any partitions already there.
+              Safe to use for every partition — each one finds the next gap.
+  LOW=NEXT    Start immediately after the last defined partition
+              (highest hi_cyl + 1).  Same as START for contiguous layouts.
+
+  HIGH=END    Fill to the last usable cylinder on the disk.
+  HIGH=+100M  Set HIGH so the partition is exactly 100 MB.
+              Suffix: K = kilobytes, M = megabytes, G = gigabytes.
+              The size is rounded DOWN to a whole number of cylinders.
+
+  Requires WRITE to commit to disk.
+
+ADDFS TYPE=<dostype> [VERSION=<hex>] [FILE=<path>] [STACKSIZE=<n>]
+  Add or replace a filesystem header (FSHD/LSEG blocks).
+  FILE loads a filesystem binary (e.g. L:pfs3aio) as LSEG blocks.
+  VERSION is a 32-bit hex version word (e.g. 0x00130000 for v19.0).
+  Requires WRITE to commit to disk.
+
+WRITE
+  Commit all pending in-memory changes to disk.
+  Without WRITE, ADDPART/ADDFS do not touch the disk.
+  In DRYRUN mode, prints what would be written instead.
+
+CLOSE
+  Close the current device.  Warns if there are uncommitted changes.
+  The device is also closed automatically at end of script.
+
+REBOOT
+  Ask Y/N, then reboot the machine.  FORCE auto-answers Y.
+  Counts down 3 seconds before rebooting so output is visible.
+  Useful at the end of a full disk-preparation script.
+
+
+EXAMPLES
+--------
+
+Prepare a disk with PFS3 (single large partition)
+--------------------------------------------------
+Save as e.g. ram:prep_pfs3.txt, then run:
+  DiskPart SCRIPT ram:prep_pfs3.txt DRYRUN   (check first)
+  DiskPart SCRIPT ram:prep_pfs3.txt FORCE    (write for real)
+
+  # -------------------------------------------------------
+  # Prepare uaehf.device unit 0 as a PFS3 disk
+  # Cylinder 0-1 : reserved for RDB
+  # DH0          : 100 MB system partition (bootable)
+  # DH1          : remainder of disk as data partition
+  # -------------------------------------------------------
+
+  OPEN uaehf.device 0
+  INIT NEW
+
+  # Load the PFS3 filesystem driver into the RDB
+  ADDFS TYPE=PFS3 FILE=L:pfs3aio
+
+  # System partition: 100 MB, bootable
+  ADDPART NAME=DH0 LOW=START HIGH=+100M TYPE=PFS3 BOOTPRI=0 BOOTABLE
+
+  # Data partition: everything that remains
+  ADDPART NAME=DH1 LOW=START HIGH=END TYPE=PFS3
+
+  WRITE
+  REBOOT
+
+
+Prepare a disk with PFS3 (three partitions)
+--------------------------------------------
+  OPEN uaehf.device 0
+  INIT NEW
+
+  ADDFS TYPE=PFS3 FILE=L:pfs3aio
+
+  ADDPART NAME=DH0 LOW=START HIGH=+100M TYPE=PFS3 BOOTPRI=0 BOOTABLE
+  ADDPART NAME=DH1 LOW=START HIGH=+500M TYPE=PFS3
+  ADDPART NAME=DH2 LOW=START HIGH=END   TYPE=PFS3
+
+  WRITE
+  REBOOT

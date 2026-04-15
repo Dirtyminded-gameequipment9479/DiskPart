@@ -14,6 +14,7 @@
 #include <exec/lists.h>
 #include <exec/nodes.h>
 #include <dos/dos.h>
+#include <dos/dosextens.h>
 #include <intuition/intuition.h>
 #include <intuition/screens.h>
 #include <graphics/gfxbase.h>
@@ -29,6 +30,7 @@
 #include <proto/graphics.h>
 #include <proto/gadtools.h>
 
+#include "cli.h"
 #include "clib.h"
 #include "devices.h"
 #include "partview.h"
@@ -194,8 +196,24 @@ static WORD run_devname_window(void)
             DevNameList_FormatDisplay(&dev_names, cols);
         }
         UWORD btn_h   = font_h + 6;
-        UWORD lv_h    = (UWORD)(font_h + 2) * 10;
         UWORD lbl_h   = (UWORD)(font_h + 2);  /* label floats above gadget top */
+        /* Size the listview to fit the actual device count.
+           Min 6 rows, max whatever fits on screen above the fixed UI below it. */
+        UWORD lv_h;
+        {
+            UWORD row_h     = (UWORD)(font_h + 2);
+            UWORD fixed_h   = bor_t + pad          /* top */
+                            + pad + lbl_h           /* label above string gadget */
+                            + btn_h + pad           /* string gadget */
+                            + btn_h + pad           /* button row */
+                            + bor_b;                /* bottom border */
+            UWORD max_rows  = (scr->Height > fixed_h + row_h * 4)
+                              ? (UWORD)((scr->Height - fixed_h) / row_h) : 6;
+            UWORD want_rows = (display_count > 4) ? display_count : 4;
+            if (want_rows < 6)  want_rows = 6;
+            if (want_rows > max_rows) want_rows = max_rows;
+            lv_h = row_h * want_rows;
+        }
         UWORD str_y   = bor_t + pad + lv_h + pad + lbl_h; /* room for label above */
         UWORD btn_y   = str_y + btn_h + pad;
         UWORD win_h   = btn_y + btn_h + pad + bor_b;
@@ -557,7 +575,17 @@ static WORD run_unitsel_window(const char *devname)
         UWORD inner_w = win_w - bor_l - bor_r;
         UWORD pad     = 4;
         UWORD btn_h   = font_h + 6;
-        UWORD lv_h    = (UWORD)(font_h + 2) * 10;
+        /* Size the listview to the number of units found, min 4, capped by screen. */
+        UWORD lv_h;
+        {
+            UWORD row_h     = (UWORD)(font_h + 2);
+            UWORD fixed_h   = bor_t + pad + pad + btn_h + pad + bor_b;
+            UWORD max_rows  = (scr->Height > fixed_h + row_h * 4)
+                              ? (UWORD)((scr->Height - fixed_h) / row_h) : 4;
+            UWORD want_rows = (unit_list.count > 4) ? (UWORD)unit_list.count : 4;
+            if (want_rows > max_rows) want_rows = max_rows;
+            lv_h = row_h * want_rows;
+        }
         UWORD win_h   = bor_t + pad + lv_h + pad + btn_h + pad + bor_b;
 
         gctx = CreateContext(&glist);
@@ -702,11 +730,26 @@ cleanup:
 
 int main(void)
 {
+    int result = 0;
+
     /* Must be first: SysBase lives at AbsExecBase (address 4) */
     SysBase = *((struct ExecBase **)4UL);
 
     DOSBase = (struct DosLibrary *)OpenLibrary("dos.library", 37);
     if (!DOSBase) goto cleanup;
+
+    /* CLI launch with arguments → CLI mode (no GUI libs needed). */
+    {
+        struct Process *proc = (struct Process *)FindTask(NULL);
+        if (proc->pr_CLI) {
+            LONG cli_rc = cli_run();
+            if (cli_rc != CLI_NO_ARGS) {
+                result = (int)cli_rc;
+                goto cleanup;
+            }
+            /* CLI_NO_ARGS: empty command line, fall through to GUI. */
+        }
+    }
 
     IntuitionBase = (struct IntuitionBase *)OpenLibrary("intuition.library", 37);
     if (!IntuitionBase) goto cleanup;
@@ -778,5 +821,5 @@ cleanup:
     if (IntuitionBase) CloseLibrary((struct Library *)IntuitionBase);
     if (DOSBase)       CloseLibrary((struct Library *)DOSBase);
 
-    return 0;
+    return result;
 }

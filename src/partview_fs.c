@@ -50,6 +50,7 @@ extern struct Library       *GadToolsBase;
 #define AFSDLG_OK       4
 #define AFSDLG_CANCEL   5
 #define AFSDLG_HEXDISP  6
+#define AFSDLG_NULL     7
 
 static char        fs_strs[MAX_FILESYSTEMS][64];
 static struct Node fs_nodes[MAX_FILESYSTEMS];
@@ -79,7 +80,7 @@ static void build_fs_list(const struct RDBInfo *rdb)
         if (fi->code && fi->code_size > 0)
             FormatSize((UQUAD)fi->code_size, codesz);
         else
-            sprintf(codesz, "No code");
+            sprintf(codesz, "NULL driver");
 
         sprintf(fs_strs[i], "%-12s  %-8s  %s", dt, ver, codesz);
 
@@ -200,9 +201,12 @@ static BOOL fs_addedit_dialog(struct FSInfo *fi, BOOL is_edit)
     struct Gadget *gctx        = NULL;
     struct Gadget *dostype_gad = NULL;
     struct Gadget *file_gad    = NULL;
+    struct Gadget *browse_gad  = NULL;
+    struct Gadget *null_gad    = NULL;
     struct Window *win         = NULL;
     struct Gadget *hex_gad     = NULL;
     BOOL           result      = FALSE;
+    BOOL           is_null     = is_edit && (fi->code == NULL);
     char           dt_str[20];
     char           hex_str[16];
     static char    file_str[256];   /* static so ASL path update persists */
@@ -238,7 +242,7 @@ static BOOL fs_addedit_dialog(struct FSInfo *fi, BOOL is_edit)
         UWORD dt_str_w = 110;                          /* DosType input: "DOS\1" or "0x444F5301" */
         UWORD dt_hex_w = inner_w - lbl_w - dt_str_w - pad * 2; /* hex readout to the right */
         UWORD gad_w    = inner_w - lbl_w - pad;
-        UWORD win_h    = bor_t + pad + row_h + pad + row_h + pad + row_h + pad + bor_b;
+        UWORD win_h    = bor_t + pad + row_h + pad + row_h + pad + row_h + pad + row_h + pad + bor_b;
         struct NewGadget ng;
         struct Gadget *prev;
 
@@ -282,11 +286,20 @@ static BOOL fs_addedit_dialog(struct FSInfo *fi, BOOL is_edit)
         ng.ng_GadgetText="Browse..."; ng.ng_GadgetID=AFSDLG_BROWSE;
         ng.ng_Flags=PLACETEXT_IN;
         { struct TagItem bt[]={{TAG_DONE,0}};
-          prev=CreateGadgetA(BUTTON_KIND,prev,&ng,bt);
-          if (!prev) goto fs_add_cleanup; }
+          browse_gad=CreateGadgetA(BUTTON_KIND,prev,&ng,bt);
+          if (!browse_gad) goto fs_add_cleanup; prev=browse_gad; }
+
+        /* NULL driver checkbox */
+        ng.ng_LeftEdge=gad_x; ng.ng_TopEdge=(WORD)(bor_t+pad+row_h+pad+row_h+pad);
+        ng.ng_Width=26; ng.ng_Height=row_h;
+        ng.ng_GadgetText="NULL driver (no code)"; ng.ng_GadgetID=AFSDLG_NULL;
+        ng.ng_Flags=PLACETEXT_RIGHT;
+        { struct TagItem ct[]={{GTCB_Checked,(ULONG)is_null},{TAG_DONE,0}};
+          null_gad=CreateGadgetA(CHECKBOX_KIND,prev,&ng,ct);
+          if (!null_gad) goto fs_add_cleanup; prev=null_gad; }
 
         /* OK / Cancel */
-        { UWORD btn_y = bor_t+pad+row_h+pad+row_h+pad;
+        { UWORD btn_y = bor_t+pad+row_h+pad+row_h+pad+row_h+pad;
           UWORD half  = (inner_w-pad*2-pad)/2;
           struct TagItem bt[]={{TAG_DONE,0}};
           ng.ng_TopEdge=btn_y; ng.ng_Height=row_h; ng.ng_Width=half;
@@ -314,6 +327,11 @@ static BOOL fs_addedit_dialog(struct FSInfo *fi, BOOL is_edit)
     UnlockPubScreen(NULL, scr); scr = NULL;
     if (!win) goto fs_add_cleanup;
     GT_RefreshWindow(win, NULL);
+    if (is_null) {
+        struct TagItem dis[]={{GA_Disabled,TRUE},{TAG_DONE,0}};
+        GT_SetGadgetAttrsA(file_gad,   win, NULL, dis);
+        GT_SetGadgetAttrsA(browse_gad, win, NULL, dis);
+    }
     ActivateGadget(dostype_gad, win, NULL);
 
     {
@@ -368,13 +386,27 @@ static BOOL fs_addedit_dialog(struct FSInfo *fi, BOOL is_edit)
                         }
                         break;
 
+                    case AFSDLG_NULL: {
+                        is_null = (null_gad->Flags & GFLG_SELECTED) ? TRUE : FALSE;
+                        { struct TagItem dt[]={{GA_Disabled,(ULONG)is_null},{TAG_DONE,0}};
+                          GT_SetGadgetAttrsA(file_gad,   win, NULL, dt);
+                          GT_SetGadgetAttrsA(browse_gad, win, NULL, dt); }
+                        break;
+                    }
+
                     case AFSDLG_OK: {
                         struct StringInfo *si;
                         si = (struct StringInfo *)dostype_gad->SpecialInfo;
                         fi->dos_type = parse_dostype((char *)si->Buffer);
-                        si = (struct StringInfo *)file_gad->SpecialInfo;
-                        if (fs_load_file(win, (char *)si->Buffer, fi))
+                        if (is_null) {
+                            if (fi->code) { FreeVec(fi->code); fi->code = NULL; }
+                            fi->code_size = 0;
                             result = TRUE;
+                        } else {
+                            si = (struct StringInfo *)file_gad->SpecialInfo;
+                            if (fs_load_file(win, (char *)si->Buffer, fi))
+                                result = TRUE;
+                        }
                         if (result) running = FALSE;
                         break;
                     }

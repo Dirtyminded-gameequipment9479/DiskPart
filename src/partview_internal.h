@@ -66,6 +66,9 @@ void  rdb_view_block     (struct Window *win, struct BlockDev *bd,
 void  rdb_raw_scan       (struct Window *win, struct BlockDev *bd);
 void  raw_disk_read      (struct Window *win, struct BlockDev *bd);
 void  raw_hex_dump       (struct Window *win, struct BlockDev *bd);
+void  smart_status       (struct Window *win, struct BlockDev *bd);
+void  bad_block_scan     (struct Window *win, struct BlockDev *bd,
+                          struct RDBInfo *rdb);
 
 /* ------------------------------------------------------------------ */
 /* partview_move.c                                                      */
