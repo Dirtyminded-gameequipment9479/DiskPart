@@ -658,6 +658,34 @@ BOOL FFS_GrowPartition(struct BlockDev *bd, const struct RDBInfo *rdb,
             goto done;
         }
 
+        /* Immediate read-back: verify the root was actually written.
+           A driver that returns success for TD_WRITE64 but ignores the
+           write (common on some IDE/CF setups at byte offsets > 4 GB)
+           will be caught here.  If verification fails we skip Phase 9b
+           and 9c — no further writes are attempted to avoid writing to
+           wrong disk locations. */
+        {
+            ULONG save_cs = root_buf[RL_CHKSUM];
+            if (!BlockDev_ReadBlock(bd, part_abs + new_root, bm_buf)) {
+                sprintf(err_buf,
+                        "Root write failed: cannot read back abs %lu.\n"
+                        "The filesystem was not modified.",
+                        (unsigned long)(part_abs + new_root));
+                goto done;
+            }
+            if (bm_buf[RL_TYPE]    != T_SHORT       ||
+                bm_buf[nlongs - 1] != (ULONG)ST_ROOT ||
+                bm_buf[RL_CHKSUM]  != save_cs) {
+                sprintf(err_buf,
+                        "Root write verification failed at abs %lu.\n"
+                        "The block was not written or was overwritten before\n"
+                        "verification (Inhibit may have failed for '%s').\n"
+                        "The filesystem was not modified.",
+                        (unsigned long)(part_abs + new_root),
+                        inh_name);
+                goto done;
+            }
+        }
     }
 
     /* ---------------------------------------------------------------- */
@@ -809,14 +837,14 @@ done:
                 bm_buf[nlongs - 1] != (ULONG)ST_ROOT) {
                 ok = FALSE;
                 sprintf(err_buf,
-                        "Root verify FAILED before Inhibit release:\n"
+                        "Root corrupted by Phase 9 writes at abs %lu.\n"
                         "type=0x%lX L[1]=%lu L[4]=%lu sec_type=0x%lX\n"
-                        "Expected T_SHORT, L[1]=0, L[4]=0, ST_ROOT at abs %lu",
+                        "A parent-pointer or old-root update overwrote new root.",
+                        (unsigned long)(part_abs + new_root),
                         (unsigned long)bm_buf[RL_TYPE],
                         (unsigned long)bm_buf[1],
                         (unsigned long)bm_buf[4],
-                        (unsigned long)bm_buf[nlongs - 1],
-                        (unsigned long)(part_abs + new_root));
+                        (unsigned long)bm_buf[nlongs - 1]);
             } else if (calc_cs != save_cs) {
                 ok = FALSE;
                 sprintf(err_buf,

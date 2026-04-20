@@ -36,6 +36,11 @@ typedef unsigned long long UQUAD;
 #define MAX_PARTITIONS   64
 #define MAX_FILESYSTEMS  32
 
+/* Extended RDB backup file format (used by backup/restore/verify) */
+#define ERDB_MAGIC   0x45524442UL   /* 'ERDB' */
+#define ERDB_VERSION 1UL
+#define ERDB_HDR_SZ  32             /* 8 longwords */
+
 /* ------------------------------------------------------------------ */
 /* Open block device handle                                            */
 /* ------------------------------------------------------------------ */
@@ -56,6 +61,9 @@ struct BlockDev {
     char             disk_brand[36];      /* vendor+product from SCSI INQUIRY    */
     ULONG            last_overflow_need;  /* blocks needed  (set on overflow)    */
     ULONG            last_overflow_avail; /* blocks available (set on overflow)  */
+    UQUAD            td_total_bytes;      /* capacity from TD_GETGEOMETRY        */
+    ULONG            rc_total_blocks;     /* READ CAPACITY(10) total blocks (0=unavail) */
+    ULONG            rc_block_size;       /* READ CAPACITY(10) bytes per block   */
 };
 
 /* Open/close a block device for probing or RDB I/O. */
@@ -67,10 +75,11 @@ BOOL             BlockDev_ReadBlock(struct BlockDev *bd, ULONG blocknum, void *b
 BOOL             BlockDev_WriteBlock(struct BlockDev *bd, ULONG blocknum, const void *buf);
 
 /*
- * Query physical geometry from the driver (TD_GETGEOMETRY).
- * Returns FALSE if the driver does not respond or reports zero sectors.
- * Applies sensible defaults (heads=16, sectors=63) when driver returns 0.
- * cyls is derived from dg_Cylinders when non-zero, else from total/h/s.
+ * Query geometry for RDB initialisation.  Prefers READ CAPACITY (10)
+ * total block count (stored in bd->rc_total_blocks by BlockDev_Open)
+ * over TD_GETGEOMETRY's often-capped cylinder count.  Falls back to
+ * TD_GETGEOMETRY if READ CAPACITY is unavailable.  Returns FALSE only
+ * when both sources report no usable data.
  */
 BOOL             BlockDev_GetGeometry(struct BlockDev *bd,
                                       ULONG *cyls, ULONG *heads, ULONG *sectors);
@@ -142,6 +151,7 @@ struct RDBInfo {
     char  disk_vendor[9];
     char  disk_product[17];
     char  disk_revision[5];
+    ULONG blk_size;      /* device block size at read time; 0 means unknown (treat as 512) */
     UWORD num_parts;
     UWORD num_fs;
     ULONG dbg_part_id;     /* pb_ID of first PART block read (debug) */
@@ -155,6 +165,11 @@ BOOL RDB_Write    (struct BlockDev *bd, struct RDBInfo *rdb);
 void RDB_InitFresh(struct RDBInfo *rdb,
                    ULONG cylinders, ULONG heads, ULONG sectors);
 void RDB_FreeCode (struct RDBInfo *rdb);  /* free all FSInfo.code buffers */
+
+typedef void (*RDB_CheckFn)(void *ud, const char *line);
+/* Returns number of errors found (0 = PASS). */
+ULONG RDB_IntegrityCheck(struct BlockDev *bd, const struct RDBInfo *rdb,
+                         RDB_CheckFn fn, void *ud);
 
 void FormatDosType(ULONG dostype, char *buf);   /* buf >= 16 bytes */
 void FormatSize   (UQUAD bytes,   char *buf);   /* buf >= 16 bytes */

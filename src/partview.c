@@ -652,7 +652,7 @@ static void draw_new_part_overlay(struct Window *win,
     pw = px2 - px1;
 
     cyls  = (hi >= lo) ? (hi - lo + 1) : 1;
-    bpc   = rdb->heads * rdb->sectors * 512UL;
+    bpc   = rdb->heads * rdb->sectors * ((rdb->blk_size > 0) ? rdb->blk_size : 512UL);
     bytes = (UQUAD)cyls * bpc;
     FormatSize(bytes, sz);
 
@@ -739,21 +739,23 @@ static void draw_info(struct Window *win, const char *devname, ULONG unit,
         if (brand && brand[0])
             strncpy(model, brand, 35);
         else if (rdb && (rdb->disk_vendor[0] || rdb->disk_product[0]))
-            sprintf(model, "%s %s", rdb->disk_vendor, rdb->disk_product);
+            snprintf(model, sizeof(model), "%s %s",
+                     rdb->disk_vendor, rdb->disk_product);
         model[35] = '\0';
 
         if (rdb && rdb->cylinders > 0) {
-            FormatSize((UQUAD)rdb->cylinders * rdb->heads * rdb->sectors * 512, sz);
+            ULONG bsz = (rdb->blk_size > 0) ? rdb->blk_size : 512;
+            FormatSize((UQUAD)rdb->cylinders * rdb->heads * rdb->sectors * bsz, sz);
         } else {
             strncpy(sz, "unknown", 15); sz[15] = '\0';
         }
 
         if (model[0])
-            sprintf(line1, "Device: %s/%lu    Size: %s    Model: %s",
-                    devname, (unsigned long)unit, sz, model);
+            snprintf(line1, sizeof(line1), "Device: %s/%lu    Size: %s    Model: %s",
+                     devname, (unsigned long)unit, sz, model);
         else
-            sprintf(line1, "Device: %s/%lu    Size: %s",
-                    devname, (unsigned long)unit, sz);
+            snprintf(line1, sizeof(line1), "Device: %s/%lu    Size: %s",
+                     devname, (unsigned long)unit, sz);
     }
 
     /* Line 2: full geometry so large cylinder counts never clip */
@@ -775,7 +777,8 @@ static void draw_info(struct Window *win, const char *devname, ULONG unit,
             ULONG used = rdb->parts[fi].high_cyl - rdb->parts[fi].low_cyl + 1;
             if (free_cyls >= used) free_cyls -= used;
         }
-        FormatSize((UQUAD)free_cyls * rdb->heads * rdb->sectors * 512UL, fsz);
+        { ULONG bsz = (rdb->blk_size > 0) ? rdb->blk_size : 512;
+          FormatSize((UQUAD)free_cyls * rdb->heads * rdb->sectors * bsz, fsz); }
         sprintf(line3, "RDB: %u partition%s         Free: %s",
                 (unsigned)rdb->num_parts,
                 rdb->num_parts == 1 ? "" : "s", fsz);
@@ -1247,6 +1250,11 @@ static struct NewMenu partview_menu_def[] = {
     { NM_ITEM,  NM_BARLABEL,             NULL,         0, 0, NULL },  /* ITEM 2 */
     { NM_ITEM,  "Extended Backup...",    NULL,         0, 0, NULL },  /* ITEM 3 */
     { NM_ITEM,  "Extended Restore...",   NULL,         0, 0, NULL },  /* ITEM 4 */
+    { NM_ITEM,  NM_BARLABEL,             NULL,         0, 0, NULL },  /* ITEM 5 */
+    { NM_ITEM,  "Verify RDB Block...",   NULL,         0, 0, NULL },  /* ITEM 6 */
+    { NM_ITEM,  "Verify Extended...",    NULL,         0, 0, NULL },  /* ITEM 7 */
+    { NM_ITEM,  NM_BARLABEL,             NULL,         0, 0, NULL },  /* ITEM 8 */
+    { NM_ITEM,  "RDB Integrity Check",   NULL,         0, 0, NULL },  /* ITEM 9 */
     /* Menu 2 — Health: disk diagnostics */
     { NM_TITLE, "Health",                NULL,         0, 0, NULL },
     { NM_ITEM,  "SMART Status",          NULL,         0, 0, NULL },  /* ITEM 0 */
@@ -1345,26 +1353,12 @@ BOOL partview_run(const char *devname, ULONG unit)
            the OS names the partition at boot time and we can recover
            that name by matching device+unit+lo_cyl+hi_cyl in the list. */
         /* nothing extra — names and DosTypes come from disk (PART/FSHD blocks) */
-        if (!rdb->valid) {
-            struct DriveGeometry geom;
-            memset(&geom, 0, sizeof(geom));
-            bd->iotd.iotd_Req.io_Command = TD_GETGEOMETRY;
-            bd->iotd.iotd_Req.io_Length  = sizeof(geom);
-            bd->iotd.iotd_Req.io_Data    = (APTR)&geom;
-            bd->iotd.iotd_Req.io_Flags   = 0;
-            if (DoIO((struct IORequest *)&bd->iotd) == 0 &&
-                geom.dg_Heads > 0 && geom.dg_TrackSectors > 0) {
-                ULONG cyls = geom.dg_Cylinders;
-                /* dg_Cylinders can be CHS-limited (e.g. 4096 max).
-                   Use dg_TotalSectors to compute the real cylinder count. */
-                if (geom.dg_TotalSectors > 0) {
-                    ULONG cyls_ts = geom.dg_TotalSectors /
-                                    (geom.dg_Heads * geom.dg_TrackSectors);
-                    if (cyls_ts > cyls) cyls = cyls_ts;
-                }
+        if (!rdb->valid && bd) {
+            ULONG cyls = 0, heads = 0, secs = 0;
+            if (BlockDev_GetGeometry(bd, &cyls, &heads, &secs)) {
                 rdb->cylinders = cyls;
-                rdb->heads     = geom.dg_Heads;
-                rdb->sectors   = geom.dg_TrackSectors;
+                rdb->heads     = heads;
+                rdb->sectors   = secs;
             }
         }
     }
@@ -1533,6 +1527,12 @@ BOOL partview_run(const char *devname, ULONG unit)
                             rdb_backup_extended(win, bd, rdb);
                         else if (MENUNUM(mcode) == 1 && ITEMNUM(mcode) == 4)
                             rdb_restore_extended(win, bd);
+                        else if (MENUNUM(mcode) == 1 && ITEMNUM(mcode) == 6)
+                            rdb_verify_block(win, bd, rdb);
+                        else if (MENUNUM(mcode) == 1 && ITEMNUM(mcode) == 7)
+                            rdb_verify_extended(win, bd);
+                        else if (MENUNUM(mcode) == 1 && ITEMNUM(mcode) == 9)
+                            rdb_integrity_check(win, bd, rdb);
                         /* Health menu */
                         else if (MENUNUM(mcode) == 2 && ITEMNUM(mcode) == 0)
                             smart_status(win, bd);
@@ -1607,6 +1607,19 @@ BOOL partview_run(const char *devname, ULONG unit)
                             WORD  part  = hit_test_edge(rdb, mx2, mw2, total,
                                                          mouse_x, &edge);
                             if (part >= 0) {
+                                if (edge == 0) {
+                                    /* Left-edge drag: not supported — inform user */
+                                    struct EasyStruct es;
+                                    es.es_StructSize   = sizeof(es);
+                                    es.es_Flags        = 0;
+                                    es.es_Title        = (UBYTE *)"Cannot Resize From Start";
+                                    es.es_TextFormat   = (UBYTE *)
+                                        "Filesystem resize is only possible when\n"
+                                        "the start cylinder is left unchanged.\n\n"
+                                        "To grow a partition, drag the right edge instead.";
+                                    es.es_GadgetFormat = (UBYTE *)"OK";
+                                    EasyRequest(win, &es, NULL);
+                                } else {
                                 /* On an edge — start drag, save originals */
                                 ULONG left_end    = rdb->lo_cyl;   /* first usable cyl */
                                 ULONG right_start = rdb->hi_cyl + 1;
@@ -1631,13 +1644,9 @@ BOOL partview_run(const char *devname, ULONG unit)
                                 drag_orig_hi   = rdb->parts[part].high_cyl;
                                 drag_move_part = -1;
                                 dbl_part       = -1;
-                                if (edge == 0) {
-                                    drag_min = left_end;
-                                    drag_max = rdb->parts[part].high_cyl;
-                                } else {
-                                    drag_min = rdb->parts[part].low_cyl;
-                                    drag_max = right_start > 0 ? right_start - 1 : 0;
-                                }
+                                drag_min = rdb->parts[part].low_cyl;
+                                drag_max = right_start > 0 ? right_start - 1 : 0;
+                                } /* edge == 1 */
                             } else {
                                 /* Inside a partition block — check double-click */
                                 WORD blk = hit_test_partition(rdb, mx2, mw2,
@@ -1653,7 +1662,7 @@ BOOL partview_run(const char *devname, ULONG unit)
                                         {
                                             ULONG old_hi = rdb->parts[sel].high_cyl;
                                             if (partition_dialog(&rdb->parts[sel],
-                                                                 "Edit Partition", rdb)) {
+                                                                 "Edit Partition", rdb, FALSE)) {
                                                 offer_ffs_grow(win, bd, rdb,
                                                                &rdb->parts[sel], old_hi);
                                                 offer_pfs_grow(win, bd, rdb,
@@ -1809,7 +1818,7 @@ BOOL partview_run(const char *devname, ULONG unit)
                                 new_pi.baud          = 0;
                                 new_pi.control       = 0;
                                 new_pi.dev_flags     = 0;
-                                if (partition_dialog(&new_pi, "Add Partition", rdb)) {
+                                if (partition_dialog(&new_pi, "Add Partition", rdb, TRUE)) {
                                     rdb->parts[rdb->num_parts++] = new_pi;
                                     dirty = TRUE; needs_reboot = TRUE;
                                     refresh_listview(win, lv_gad, rdb, sel);
@@ -1949,7 +1958,7 @@ BOOL partview_run(const char *devname, ULONG unit)
                             sel >= 0 && sel < (WORD)rdb->num_parts) {
                             ULONG old_hi = rdb->parts[sel].high_cyl;
                             if (partition_dialog(&rdb->parts[sel],
-                                                 "Edit Partition", rdb)) {
+                                                 "Edit Partition", rdb, FALSE)) {
                                 offer_ffs_grow(win, bd, rdb,
                                                &rdb->parts[sel], old_hi);
                                 offer_pfs_grow(win, bd, rdb,
@@ -1977,27 +1986,29 @@ BOOL partview_run(const char *devname, ULONG unit)
 
                     case GID_INITRDB: {
                         struct EasyStruct es;
-                        struct DriveGeometry geom;
                         ULONG real_cyls = 0, real_heads = 0, real_secs = 0;
+                        char  driver_warn[200];
 
-                        /* Always fetch actual geometry from the device */
+                        driver_warn[0] = '\0';
+
                         if (bd) {
-                            memset(&geom, 0, sizeof(geom));
-                            bd->iotd.iotd_Req.io_Command = TD_GETGEOMETRY;
-                            bd->iotd.iotd_Req.io_Length  = sizeof(geom);
-                            bd->iotd.iotd_Req.io_Data    = (APTR)&geom;
-                            bd->iotd.iotd_Req.io_Flags   = 0;
-                            if (DoIO((struct IORequest *)&bd->iotd) == 0 &&
-                                geom.dg_Heads > 0 && geom.dg_TrackSectors > 0) {
-                                real_cyls  = geom.dg_Cylinders;
-                                real_heads = geom.dg_Heads;
-                                real_secs  = geom.dg_TrackSectors;
-                                /* dg_Cylinders can be CHS-limited (e.g. 4096 max).
-                                   Use dg_TotalSectors for the real cylinder count. */
-                                if (geom.dg_TotalSectors > 0) {
-                                    ULONG cyls_ts = geom.dg_TotalSectors /
-                                                    (real_heads * real_secs);
-                                    if (cyls_ts > real_cyls) real_cyls = cyls_ts;
+                            BlockDev_GetGeometry(bd, &real_cyls, &real_heads, &real_secs);
+
+                            /* Warn when READ CAPACITY reports significantly more
+                               capacity than TD_GETGEOMETRY — old driver limiting. */
+                            if (bd->rc_total_blocks > 0 && bd->td_total_bytes > 0) {
+                                UQUAD rc_bytes = (UQUAD)bd->rc_total_blocks *
+                                                 bd->rc_block_size;
+                                if (rc_bytes > bd->td_total_bytes +
+                                               bd->td_total_bytes / 20) {
+                                    char td_sz[16], rc_sz[16];
+                                    FormatSize(bd->td_total_bytes, td_sz);
+                                    FormatSize(rc_bytes, rc_sz);
+                                    sprintf(driver_warn,
+                                        "\nDrive reports %s, driver reports %s.\n"
+                                        "Driver may be limited (old scsi.device?).\n"
+                                        "I/O beyond driver limit may fail.",
+                                        rc_sz, td_sz);
                                 }
                             }
                         }
@@ -2029,7 +2040,7 @@ BOOL partview_run(const char *devname, ULONG unit)
                                     "Re-init: wipe all partitions, create fresh RDB.\n"
                                     "Update Geometry (EXPERIMENTAL): keep partitions,\n"
                                     "  update RDB to match device size.\n"
-                                    "Manual...: enter geometry by hand.",
+                                    "Manual...: enter geometry by hand.%s",
                                     (unsigned)rdb->num_parts,
                                     rdb->num_parts == 1 ? "" : "s",
                                     (unsigned long)real_cyls,
@@ -2037,7 +2048,8 @@ BOOL partview_run(const char *devname, ULONG unit)
                                     (unsigned long)real_secs,
                                     (unsigned long)rdb->cylinders,
                                     (unsigned long)rdb->heads,
-                                    (unsigned long)rdb->sectors);
+                                    (unsigned long)rdb->sectors,
+                                    driver_warn);
 
                                 es.es_StructSize   = sizeof(es);
                                 es.es_Flags        = 0;
@@ -2082,15 +2094,19 @@ BOOL partview_run(const char *devname, ULONG unit)
                             BOOL geom_retry = TRUE;
                             while (geom_retry) {
                                 LONG choice;
+                                char msg_nordb[512];
                                 geom_retry = FALSE;
+
+                                sprintf(msg_nordb,
+                                    "Create a new RDB on this disk?\n"
+                                    "All existing data will be lost.\n\n"
+                                    "Manual...: enter geometry by hand.%s",
+                                    driver_warn);
 
                                 es.es_StructSize   = sizeof(es);
                                 es.es_Flags        = 0;
                                 es.es_Title        = (UBYTE *)"Init RDB";
-                                es.es_TextFormat   =
-                                    (UBYTE *)"Create a new RDB on this disk?\n"
-                                             "All existing data will be lost.\n\n"
-                                             "Manual...: enter geometry by hand.";
+                                es.es_TextFormat   = (UBYTE *)msg_nordb;
                                 es.es_GadgetFormat = (UBYTE *)"Yes|Manual...|No";
                                 choice = EasyRequest(win, &es, NULL);
 
@@ -2154,7 +2170,7 @@ BOOL partview_run(const char *devname, ULONG unit)
                         new_pi.dev_flags     = 0;
                         /* flags: 0 = bootable */
 
-                        if (partition_dialog(&new_pi, "Add Partition", rdb)) {
+                        if (partition_dialog(&new_pi, "Add Partition", rdb, TRUE)) {
                             rdb->parts[rdb->num_parts++] = new_pi;
                             dirty = TRUE; needs_reboot = TRUE;
                             refresh_listview(win, lv_gad, rdb, sel);
@@ -2169,7 +2185,7 @@ BOOL partview_run(const char *devname, ULONG unit)
                         if (sel >= 0 && sel < (WORD)rdb->num_parts) {
                             ULONG old_hi = rdb->parts[sel].high_cyl;
                             if (partition_dialog(&rdb->parts[sel],
-                                                 "Edit Partition", rdb)) {
+                                                 "Edit Partition", rdb, FALSE)) {
                                 offer_ffs_grow(win, bd, rdb,
                                                &rdb->parts[sel], old_hi);
                                 offer_pfs_grow(win, bd, rdb,

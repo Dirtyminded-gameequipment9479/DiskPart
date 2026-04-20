@@ -95,44 +95,44 @@ static int fmt_ulong(char *tmp, unsigned long val, int base, int upper)
     return len;
 }
 
-int sprintf(char *buf, const char *fmt, ...)
+/* Internal bounded formatter shared by sprintf and snprintf.
+   size == 0 means unbounded (sprintf legacy behaviour). */
+static int do_fmt(char *buf, size_t size, const char *fmt, va_list ap)
 {
-    va_list ap;
-    char *out = buf;
+    char *out  = buf;
+    char *end  = (size > 0) ? buf + size - 1 : (char *)~(size_t)0;
     const char *f = fmt;
-    va_start(ap, fmt);
+
+#define PUT(c) do { if (out < end) *out++ = (c); } while(0)
 
     while (*f) {
-        if (*f != '%') { *out++ = *f++; continue; }
+        if (*f != '%') { PUT(*f++); continue; }
         f++;
 
-        /* Flags */
         int left = 0;
         char fill = ' ';
         if (*f == '-') { left = 1; f++; }
         if (*f == '0' && !left) { fill = '0'; f++; }
 
-        /* Width */
         int width = 0;
         while (*f >= '0' && *f <= '9') { width = width * 10 + (*f - '0'); f++; }
 
-        /* Length modifier */
         int is_long = 0;
         if (*f == 'l') { is_long = 1; f++; }
 
         char spec = *f++;
 
-        if (spec == '%') { *out++ = '%'; continue; }
-        if (spec == 'c') { *out++ = (char)va_arg(ap, int); continue; }
+        if (spec == '%') { PUT('%'); continue; }
+        if (spec == 'c') { PUT((char)va_arg(ap, int)); continue; }
 
         if (spec == 's') {
             const char *sv = va_arg(ap, const char *);
             int slen, i;
             if (!sv) sv = "(null)";
             slen = 0; { const char *p = sv; while (*p++) slen++; }
-            if (!left) for (i = slen; i < width; i++) *out++ = ' ';
-            while (*sv) *out++ = *sv++;
-            if ( left) for (i = slen; i < width; i++) *out++ = ' ';
+            if (!left) for (i = slen; i < width; i++) PUT(' ');
+            while (*sv) PUT(*sv++);
+            if ( left) for (i = slen; i < width; i++) PUT(' ');
             continue;
         }
 
@@ -153,25 +153,45 @@ int sprintf(char *buf, const char *fmt, ...)
             unsigned long uv = is_long ? va_arg(ap, unsigned long) : (unsigned long)va_arg(ap, unsigned int);
             len = fmt_ulong(tmp, uv, 16, 1);
         } else {
-            *out++ = '%'; *out++ = spec; continue;
+            PUT('%'); PUT(spec); continue;
         }
 
         {
             int total = len + (neg ? 1 : 0);
             int i;
             if (!left) {
-                if (neg && fill == '0') *out++ = '-';
-                for (i = total; i < width; i++) *out++ = fill;
-                if (neg && fill != '0') *out++ = '-';
+                if (neg && fill == '0') PUT('-');
+                for (i = total; i < width; i++) PUT(fill);
+                if (neg && fill != '0') PUT('-');
             } else {
-                if (neg) *out++ = '-';
+                if (neg) PUT('-');
             }
-            for (i = 0; i < len; i++) *out++ = tmp[i];
-            if (left) for (i = total; i < width; i++) *out++ = ' ';
+            for (i = 0; i < len; i++) PUT(tmp[i]);
+            if (left) for (i = total; i < width; i++) PUT(' ');
         }
     }
 
-    va_end(ap);
+#undef PUT
     *out = '\0';
     return (int)(out - buf);
+}
+
+int sprintf(char *buf, const char *fmt, ...)
+{
+    va_list ap;
+    int n;
+    va_start(ap, fmt);
+    n = do_fmt(buf, 0, fmt, ap);
+    va_end(ap);
+    return n;
+}
+
+int snprintf(char *buf, size_t size, const char *fmt, ...)
+{
+    va_list ap;
+    int n;
+    va_start(ap, fmt);
+    n = do_fmt(buf, size, fmt, ap);
+    va_end(ap);
+    return n;
 }

@@ -41,7 +41,8 @@ extern struct DosLibrary *DOSBase;
     "LISTDEV/S,UNITS/S,DEV/K,INIT/K,FORCE/S,SCRIPT/K,DRYRUN/S," \
     "INFO/S,SMART/S,"                                             \
     "BACKUP/K,RESTORE/K,BACKUPEXT/K,RESTOREEXT/K,"               \
-    "ADDPART/S,ADDFS/S,"                                          \
+    "VERIFY/K,VERIFYEXT/K,"                                       \
+    "ADDPART/S,ADDFS/S,DELPART/S,CHECK/S,"                        \
     "NAME/K,LOW/K,HIGH/K,TYPE/K,BOOTPRI/K,BOOTABLE/S,"           \
     "FILE/K,VERSION/K,STACKSIZE/K"
 
@@ -59,8 +60,12 @@ enum {
     ARG_RESTORE,
     ARG_BACKUPEXT,
     ARG_RESTOREEXT,
+    ARG_VERIFY,
+    ARG_VERIFYEXT,
     ARG_ADDPART,
     ARG_ADDFS,
+    ARG_DELPART,
+    ARG_CHECK,
     ARG_NAME,
     ARG_LOW,
     ARG_HIGH,
@@ -1107,6 +1112,303 @@ static LONG cmd_addfs(const char *devname, ULONG unit, BOOL force,
 }
 
 /* ------------------------------------------------------------------ */
+/* CHECK — RDB integrity check                                         */
+/* ------------------------------------------------------------------ */
+
+static void check_cli_cb(void *ud, const char *line)
+{
+    char buf[82];
+    (void)ud;
+    sprintf(buf, "%s\n", line);
+    PutStr((CONST_STRPTR)buf);
+}
+
+static LONG cmd_check(const char *devname, ULONG unit)
+{
+    struct BlockDev *bd;
+    ULONG errs;
+
+    sprintf(outbuf, "Opening %s unit %lu...\n", devname, unit);
+    cli_puts(outbuf);
+    bd = BlockDev_Open(devname, unit);
+    if (!bd) {
+        sprintf(outbuf, "ERROR: Cannot open %s unit %lu.\n", devname, unit);
+        cli_puts(outbuf); return RETURN_ERROR;
+    }
+
+    memset(&s_rdb, 0, sizeof(s_rdb));
+    if (!RDB_Read(bd, &s_rdb) || !s_rdb.valid) {
+        cli_puts("ERROR: No valid RDB found.\n");
+        BlockDev_Close(bd); return RETURN_ERROR;
+    }
+
+    errs = RDB_IntegrityCheck(bd, &s_rdb, check_cli_cb, NULL);
+
+    RDB_FreeCode(&s_rdb);
+    BlockDev_Close(bd);
+    return (errs == 0) ? RETURN_OK : RETURN_WARN;
+}
+
+/* ------------------------------------------------------------------ */
+/* VERIFY / VERIFYEXT — compare backup file to live disk              */
+/* ------------------------------------------------------------------ */
+
+static LONG cmd_verify(const char *devname, ULONG unit, const char *path)
+{
+    struct BlockDev *bd;
+    BPTR  fh;
+    LONG  fsize;
+    UBYTE *fbuf = NULL, *dbuf = NULL;
+    ULONG i, diff_count = 0, first_diff = 0xFFFFFFFFUL;
+
+    if (!path || !path[0]) {
+        cli_puts("VERIFY requires a FILE path.\n"); return RETURN_WARN;
+    }
+
+    sprintf(outbuf, "Opening %s unit %lu...\n", devname, unit);
+    cli_puts(outbuf);
+    bd = BlockDev_Open(devname, unit);
+    if (!bd) {
+        sprintf(outbuf, "ERROR: Cannot open %s unit %lu.\n", devname, unit);
+        cli_puts(outbuf); return RETURN_ERROR;
+    }
+
+    memset(&s_rdb, 0, sizeof(s_rdb));
+    if (!RDB_Read(bd, &s_rdb) || !s_rdb.valid) {
+        cli_puts("ERROR: No valid RDB found.\n");
+        BlockDev_Close(bd); return RETURN_ERROR;
+    }
+
+    fh = Open((UBYTE *)path, MODE_OLDFILE);
+    if (!fh) {
+        cli_puts("ERROR: Cannot open backup file.\n");
+        RDB_FreeCode(&s_rdb); BlockDev_Close(bd); return RETURN_ERROR;
+    }
+    Seek(fh, 0, OFFSET_END);
+    fsize = Seek(fh, 0, OFFSET_BEGINNING);
+
+    if (fsize != (LONG)bd->block_size) {
+        sprintf(outbuf, "ERROR: File size (%ld) != block size (%lu).\n",
+                (long)fsize, (unsigned long)bd->block_size);
+        cli_puts(outbuf);
+        Close(fh); RDB_FreeCode(&s_rdb); BlockDev_Close(bd); return RETURN_ERROR;
+    }
+
+    fbuf = (UBYTE *)AllocVec(bd->block_size, MEMF_PUBLIC | MEMF_CLEAR);
+    dbuf = (UBYTE *)AllocVec(bd->block_size, MEMF_PUBLIC | MEMF_CLEAR);
+    if (!fbuf || !dbuf) {
+        Close(fh);
+        if (fbuf) FreeVec(fbuf); if (dbuf) FreeVec(dbuf);
+        RDB_FreeCode(&s_rdb); BlockDev_Close(bd); return RETURN_ERROR;
+    }
+
+    if (Read(fh, fbuf, fsize) != fsize) {
+        cli_puts("ERROR: File read error.\n");
+        Close(fh); FreeVec(fbuf); FreeVec(dbuf);
+        RDB_FreeCode(&s_rdb); BlockDev_Close(bd); return RETURN_ERROR;
+    }
+    Close(fh);
+
+    if (!BlockDev_ReadBlock(bd, s_rdb.block_num, dbuf)) {
+        cli_puts("ERROR: Cannot read RDB block from disk.\n");
+        FreeVec(fbuf); FreeVec(dbuf);
+        RDB_FreeCode(&s_rdb); BlockDev_Close(bd); return RETURN_ERROR;
+    }
+
+    for (i = 0; i < bd->block_size; i++) {
+        if (fbuf[i] != dbuf[i]) {
+            if (first_diff == 0xFFFFFFFFUL) first_diff = i;
+            diff_count++;
+        }
+    }
+
+    FreeVec(fbuf); FreeVec(dbuf);
+    RDB_FreeCode(&s_rdb); BlockDev_Close(bd);
+
+    if (diff_count == 0) {
+        cli_puts("VERIFY: MATCH — backup matches RDB block on disk.\n");
+        return RETURN_OK;
+    } else {
+        sprintf(outbuf, "VERIFY: MISMATCH — %lu byte(s) differ, first at offset %lu.\n",
+                (unsigned long)diff_count, (unsigned long)first_diff);
+        cli_puts(outbuf);
+        return RETURN_WARN;
+    }
+}
+
+static LONG cmd_verifyext(const char *devname, ULONG unit, const char *path)
+{
+    struct BlockDev *bd;
+    BPTR   fh;
+    ULONG  hdr[8];
+    ULONG  block_lo, block_size, num_blocks, blk;
+    ULONG  bad_blocks = 0;
+    UBYTE *fbuf = NULL, *dbuf = NULL;
+
+    if (!path || !path[0]) {
+        cli_puts("VERIFYEXT requires a FILE path.\n"); return RETURN_WARN;
+    }
+
+    sprintf(outbuf, "Opening %s unit %lu...\n", devname, unit);
+    cli_puts(outbuf);
+    bd = BlockDev_Open(devname, unit);
+    if (!bd) {
+        sprintf(outbuf, "ERROR: Cannot open %s unit %lu.\n", devname, unit);
+        cli_puts(outbuf); return RETURN_ERROR;
+    }
+
+    fh = Open((UBYTE *)path, MODE_OLDFILE);
+    if (!fh) {
+        cli_puts("ERROR: Cannot open backup file.\n");
+        BlockDev_Close(bd); return RETURN_ERROR;
+    }
+
+    if (Read(fh, hdr, ERDB_HDR_SZ) != ERDB_HDR_SZ ||
+        hdr[0] != ERDB_MAGIC || hdr[1] != ERDB_VERSION) {
+        Close(fh); BlockDev_Close(bd);
+        cli_puts("ERROR: Not a valid ERDB backup (bad magic/version).\n");
+        return RETURN_ERROR;
+    }
+
+    block_lo   = hdr[2];
+    block_size = hdr[3];
+    num_blocks = hdr[4];
+
+    if (block_size != bd->block_size) {
+        sprintf(outbuf, "ERROR: Block size mismatch: backup=%lu, device=%lu.\n",
+                (unsigned long)block_size, (unsigned long)bd->block_size);
+        cli_puts(outbuf);
+        Close(fh); BlockDev_Close(bd); return RETURN_ERROR;
+    }
+    if (num_blocks == 0 || num_blocks > 1024) {
+        cli_puts("ERROR: Unreasonable block count in header.\n");
+        Close(fh); BlockDev_Close(bd); return RETURN_ERROR;
+    }
+
+    fbuf = (UBYTE *)AllocVec(block_size, MEMF_PUBLIC | MEMF_CLEAR);
+    dbuf = (UBYTE *)AllocVec(block_size, MEMF_PUBLIC | MEMF_CLEAR);
+    if (!fbuf || !dbuf) {
+        Close(fh);
+        if (fbuf) FreeVec(fbuf); if (dbuf) FreeVec(dbuf);
+        BlockDev_Close(bd); return RETURN_ERROR;
+    }
+
+    sprintf(outbuf, "Verifying %lu blocks from block %lu...\n",
+            (unsigned long)num_blocks, (unsigned long)block_lo);
+    cli_puts(outbuf);
+
+    for (blk = 0; blk < num_blocks; blk++) {
+        ULONG disk_blk = block_lo + blk;
+        ULONG i, diff = 0;
+
+        if (Read(fh, fbuf, (LONG)block_size) != (LONG)block_size) {
+            sprintf(outbuf, "  Blk %lu: FILE READ ERROR\n", (unsigned long)disk_blk);
+            cli_puts(outbuf); bad_blocks++; break;
+        }
+        if (!BlockDev_ReadBlock(bd, disk_blk, dbuf)) {
+            sprintf(outbuf, "  Blk %lu: DISK READ ERROR\n", (unsigned long)disk_blk);
+            cli_puts(outbuf); bad_blocks++; continue;
+        }
+        for (i = 0; i < block_size; i++)
+            if (fbuf[i] != dbuf[i]) diff++;
+
+        if (diff == 0) {
+            sprintf(outbuf, "  Blk %lu: MATCH\n", (unsigned long)disk_blk);
+        } else {
+            ULONG first = 0;
+            for (first = 0; first < block_size; first++)
+                if (fbuf[first] != dbuf[first]) break;
+            sprintf(outbuf, "  Blk %lu: MISMATCH  %lu byte(s), first @ 0x%04lX\n",
+                    (unsigned long)disk_blk,
+                    (unsigned long)diff,
+                    (unsigned long)first);
+            bad_blocks++;
+        }
+        cli_puts(outbuf);
+    }
+    Close(fh);
+    FreeVec(fbuf); FreeVec(dbuf);
+    BlockDev_Close(bd);
+
+    if (bad_blocks == 0) {
+        sprintf(outbuf, "VERIFY: PASS  All %lu blocks match.\n",
+                (unsigned long)num_blocks);
+        cli_puts(outbuf);
+        return RETURN_OK;
+    } else {
+        sprintf(outbuf, "VERIFY: FAIL  %lu/%lu blocks have differences.\n",
+                (unsigned long)bad_blocks, (unsigned long)num_blocks);
+        cli_puts(outbuf);
+        return RETURN_WARN;
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* DELPART — delete a partition by name, then write RDB               */
+/* ------------------------------------------------------------------ */
+
+static LONG cmd_delpart(const char *devname, ULONG unit, BOOL force,
+                        const char *name_s)
+{
+    struct BlockDev *bd;
+    char   name[32];
+    UWORD  nlen, i, j;
+    LONG   rc;
+
+    if (!name_s || !name_s[0])
+        { cli_puts("DELPART requires NAME=<drivename>.\n"); return RETURN_WARN; }
+    strncpy(name, name_s, 30); name[30] = '\0';
+    nlen = (UWORD)strlen(name);
+    if (nlen > 0 && name[nlen - 1] == ':') name[--nlen] = '\0';
+    if (nlen == 0) { cli_puts("DELPART: NAME is empty.\n"); return RETURN_WARN; }
+
+    sprintf(outbuf, "Opening %s unit %lu...\n", devname, unit);
+    cli_puts(outbuf);
+    bd = BlockDev_Open(devname, unit);
+    if (!bd) {
+        sprintf(outbuf, "ERROR: Cannot open %s unit %lu.\n", devname, unit);
+        cli_puts(outbuf); return RETURN_ERROR;
+    }
+
+    memset(&s_rdb, 0, sizeof(s_rdb));
+    if (!RDB_Read(bd, &s_rdb) || !s_rdb.valid) {
+        cli_puts("ERROR: No valid RDB found.\n");
+        BlockDev_Close(bd); return RETURN_ERROR;
+    }
+
+    for (i = 0; i < s_rdb.num_parts; i++) {
+        if (str_eq_ci(s_rdb.parts[i].drive_name, name)) {
+            sprintf(outbuf, "Delete: %-6s  cyls %lu-%lu  — are you sure?",
+                    s_rdb.parts[i].drive_name,
+                    (ULONG)s_rdb.parts[i].low_cyl,
+                    (ULONG)s_rdb.parts[i].high_cyl);
+            if (!ask_yn(outbuf, force)) {
+                cli_puts("Aborted. No changes written.\n");
+                RDB_FreeCode(&s_rdb); BlockDev_Close(bd); return RETURN_OK;
+            }
+
+            for (j = i; j + 1 < s_rdb.num_parts; j++)
+                s_rdb.parts[j] = s_rdb.parts[j + 1];
+            s_rdb.num_parts--;
+
+            cli_puts("Writing RDB... ");
+            rc = RDB_Write(bd, &s_rdb) ? RETURN_OK : RETURN_ERROR;
+            cli_puts(rc == RETURN_OK ? "OK.\n" : "FAILED.\n");
+
+            RDB_FreeCode(&s_rdb);
+            BlockDev_Close(bd);
+            return rc;
+        }
+    }
+
+    sprintf(outbuf, "ERROR: Partition \"%s\" not found.\n", name);
+    cli_puts(outbuf);
+    RDB_FreeCode(&s_rdb);
+    BlockDev_Close(bd);
+    return RETURN_ERROR;
+}
+
+/* ------------------------------------------------------------------ */
 /* INIT NEW — create a fresh RDB on a blank or overwrite disk         */
 /* ------------------------------------------------------------------ */
 
@@ -1302,7 +1604,9 @@ LONG cli_run(void)
     if (!args[ARG_LISTDEV] && !args[ARG_INIT]         && !args[ARG_SCRIPT]  &&
         !args[ARG_INFO]    && !args[ARG_SMART]         && !args[ARG_BACKUP] &&
         !args[ARG_RESTORE] && !args[ARG_BACKUPEXT]     && !args[ARG_RESTOREEXT] &&
-        !args[ARG_ADDPART] && !args[ARG_ADDFS]) {
+        !args[ARG_VERIFY]  && !args[ARG_VERIFYEXT]    &&
+        !args[ARG_ADDPART] && !args[ARG_ADDFS] && !args[ARG_DELPART] &&
+        !args[ARG_CHECK]) {
         FreeArgs(rdargs);
         return CLI_NO_ARGS;
     }
@@ -1340,7 +1644,9 @@ LONG cli_run(void)
         (args[ARG_INFO]      || args[ARG_SMART]      ||
          args[ARG_BACKUP]    || args[ARG_RESTORE]    ||
          args[ARG_BACKUPEXT] || args[ARG_RESTOREEXT] ||
-         args[ARG_ADDPART]   || args[ARG_ADDFS])) {
+         args[ARG_VERIFY]    || args[ARG_VERIFYEXT] ||
+         args[ARG_ADDPART]   || args[ARG_ADDFS]   ||
+         args[ARG_DELPART]   || args[ARG_CHECK])) {
 
         char  devname[64];
         ULONG unit;
@@ -1391,6 +1697,19 @@ LONG cli_run(void)
                                  (const char *)args[ARG_TYPE],
                                  (const char *)args[ARG_BOOTPRI],
                                  (BOOL)args[ARG_BOOTABLE]);
+
+            if (rc == RETURN_OK && args[ARG_DELPART])
+                rc = cmd_delpart(devname, unit, force,
+                                 (const char *)args[ARG_NAME]);
+
+            if (rc == RETURN_OK && args[ARG_VERIFY])
+                rc = cmd_verify(devname, unit, (const char *)args[ARG_VERIFY]);
+
+            if (rc == RETURN_OK && args[ARG_VERIFYEXT])
+                rc = cmd_verifyext(devname, unit, (const char *)args[ARG_VERIFYEXT]);
+
+            if (rc == RETURN_OK && args[ARG_CHECK])
+                rc = cmd_check(devname, unit);
         }
     }
 

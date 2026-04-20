@@ -66,6 +66,56 @@ static void local_delete_port(struct MsgPort *port)
 }
 
 /* ------------------------------------------------------------------ */
+/* try_read_capacity                                                   */
+/* Issue SCSI READ CAPACITY(10) directly to the drive via HD_SCSICMD. */
+/* Returns TRUE and fills *out_total/*out_blksz on success.           */
+/* ------------------------------------------------------------------ */
+
+static BOOL try_read_capacity(struct BlockDev *bd,
+                               ULONG *out_total, ULONG *out_blksz)
+{
+    struct SCSICmd scsi;
+    UBYTE buf[8];
+    UBYTE cdb[10];
+    UBYTE sense[18];
+
+    memset(&scsi,  0, sizeof(scsi));
+    memset(buf,    0, sizeof(buf));
+    memset(cdb,    0, sizeof(cdb));
+    memset(sense,  0, sizeof(sense));
+
+    cdb[0] = 0x25;  /* READ CAPACITY (10) */
+
+    scsi.scsi_Data        = (UWORD *)buf;
+    scsi.scsi_Length      = 8;
+    scsi.scsi_Command     = cdb;
+    scsi.scsi_CmdLength   = 10;
+    scsi.scsi_Flags       = SCSIF_READ | SCSIF_AUTOSENSE;
+    scsi.scsi_SenseData   = sense;
+    scsi.scsi_SenseLength = sizeof(sense);
+
+    bd->iotd.iotd_Req.io_Command = HD_SCSICMD;
+    bd->iotd.iotd_Req.io_Length  = sizeof(scsi);
+    bd->iotd.iotd_Req.io_Data    = (APTR)&scsi;
+    bd->iotd.iotd_Req.io_Flags   = 0;
+    bd->iotd.iotd_Count          = 0;
+
+    if (DoIO((struct IORequest *)&bd->iotd) != 0) return FALSE;
+    if (scsi.scsi_Status != 0)                    return FALSE;
+
+    {
+        ULONG last_lba = ((ULONG)buf[0]<<24)|((ULONG)buf[1]<<16)|
+                         ((ULONG)buf[2]<<8) |(ULONG)buf[3];
+        ULONG blksz    = ((ULONG)buf[4]<<24)|((ULONG)buf[5]<<16)|
+                         ((ULONG)buf[6]<<8) |(ULONG)buf[7];
+        if (last_lba == 0) return FALSE;
+        *out_total = last_lba + 1;
+        *out_blksz = (blksz >= 512) ? blksz : 512;
+    }
+    return TRUE;
+}
+
+/* ------------------------------------------------------------------ */
 /* BlockDev_Open                                                       */
 /* ------------------------------------------------------------------ */
 
@@ -107,13 +157,11 @@ struct BlockDev *BlockDev_Open(const char *devname, ULONG unit)
 
     bd->block_size  = 512;   /* RDB format requires 512-byte blocks */
     {
-        /* Use the reported sector size for capacity math so large-sector
-           devices (4K native, etc.) display the correct total size.
-           Fall back to 512 if the driver returns 0 or a nonsense value. */
         ULONG sec_sz = (geom.dg_SectorSize >= 512) ? geom.dg_SectorSize : 512;
-        bd->total_bytes = (geom.dg_TotalSectors > 0)
-                          ? (UQUAD)geom.dg_TotalSectors * sec_sz
-                          : 0;
+        bd->total_bytes    = (geom.dg_TotalSectors > 0)
+                             ? (UQUAD)geom.dg_TotalSectors * sec_sz
+                             : 0;
+        bd->td_total_bytes = bd->total_bytes;
     }
 
     /* SCSI INQUIRY to get vendor/product for display (best effort) */
@@ -163,6 +211,18 @@ struct BlockDev *BlockDev_Open(const char *devname, ULONG unit)
                 bd->disk_brand[35] = '\0';
             }
             FreeVec(inq);
+        }
+    }
+
+    /* READ CAPACITY (10) — true capacity direct from drive, bypasses
+       the cylinder count limitations in some older drivers (e.g. A3000
+       scsi.device).  Overrides td_total_bytes when available. */
+    {
+        ULONG rc_total = 0, rc_blksz = 512;
+        if (try_read_capacity(bd, &rc_total, &rc_blksz)) {
+            bd->rc_total_blocks = rc_total;
+            bd->rc_block_size   = rc_blksz;
+            bd->total_bytes     = (UQUAD)rc_total * rc_blksz;
         }
     }
 
@@ -298,19 +358,27 @@ BOOL BlockDev_GetGeometry(struct BlockDev *bd,
                           ULONG *cyls, ULONG *heads, ULONG *sectors)
 {
     struct DriveGeometry geom;
+    BOOL td_ok;
 
     memset(&geom, 0, sizeof(geom));
     bd->iotd.iotd_Req.io_Command = TD_GETGEOMETRY;
     bd->iotd.iotd_Req.io_Length  = sizeof(geom);
     bd->iotd.iotd_Req.io_Data    = (APTR)&geom;
     bd->iotd.iotd_Req.io_Flags   = 0;
-    if (DoIO((struct IORequest *)&bd->iotd) != 0) return FALSE;
-    if (geom.dg_TotalSectors == 0)                return FALSE;
+    td_ok = (DoIO((struct IORequest *)&bd->iotd) == 0) &&
+            (geom.dg_TotalSectors > 0 || geom.dg_Cylinders > 0);
+
+    /* Fail only if both TD_GETGEOMETRY and READ CAPACITY have no data */
+    if (!td_ok && bd->rc_total_blocks == 0) return FALSE;
 
     *heads   = (geom.dg_Heads        > 0) ? geom.dg_Heads        : 16;
     *sectors = (geom.dg_TrackSectors > 0) ? geom.dg_TrackSectors : 63;
 
-    if (geom.dg_Cylinders > 0)
+    /* Prefer READ CAPACITY total block count — it comes directly from
+       the drive and is not subject to driver CHS arithmetic bugs. */
+    if (bd->rc_total_blocks > 0)
+        *cyls = bd->rc_total_blocks / (*heads * *sectors);
+    else if (geom.dg_Cylinders > 0)
         *cyls = geom.dg_Cylinders;
     else
         *cyls = geom.dg_TotalSectors / (*heads * *sectors);
@@ -451,6 +519,7 @@ BOOL RDB_Read(struct BlockDev *bd, struct RDBInfo *rdb)
         }
 
         rdb->valid       = TRUE;
+        rdb->blk_size    = bd->block_size;
         rdb->block_num   = blk;
         rdb->flags       = rdsk->rdb_Flags;
         rdb->cylinders   = rdsk->rdb_Cylinders;
@@ -721,6 +790,185 @@ void RDB_FreeCode(struct RDBInfo *rdb)
 }
 
 /* ------------------------------------------------------------------ */
+/* RDB_IntegrityCheck                                                   */
+/* ------------------------------------------------------------------ */
+
+ULONG RDB_IntegrityCheck(struct BlockDev *bd, const struct RDBInfo *rdb,
+                         RDB_CheckFn fn, void *ud)
+{
+    ULONG *buf;
+    ULONG  errors = 0;
+    char   line[80];
+    UWORD  i;
+
+#define IC_OUT(s)       do { if (fn) fn(ud, (s)); } while(0)
+#define IC_LINE(...)    do { sprintf(line, __VA_ARGS__); IC_OUT(line); } while(0)
+#define IC_ERR(s)       do { errors++; IC_OUT(s); } while(0)
+#define IC_ERRLINE(...) do { errors++; sprintf(line, __VA_ARGS__); IC_OUT(line); } while(0)
+#define IC_CHKSUM(sl_, buf_) do { \
+    ULONG _sl = (sl_); \
+    if (_sl >= 2 && _sl <= 128) { \
+        ULONG _s = 0, _k; \
+        for (_k = 0; _k < _sl; _k++) _s += (buf_)[_k]; \
+        if (_s != 0) IC_ERR("    CHECKSUM BAD"); \
+        else IC_OUT("    Checksum: OK"); \
+    } else { IC_LINE("    Checksum: skipped (SummedLongs=%lu)", _sl); } \
+} while(0)
+
+    if (!rdb || !rdb->valid) { IC_ERR("No valid RDB."); return 1; }
+
+    buf = (ULONG *)AllocVec(512, MEMF_PUBLIC | MEMF_CLEAR);
+    if (!buf) { IC_ERR("Out of memory."); return 1; }
+
+    IC_LINE("Device: %s unit %lu", bd->devname, (ULONG)bd->unit);
+    IC_OUT("");
+
+    /* --- RDSK block --- */
+    IC_LINE("RDSK block %lu:", rdb->block_num);
+    if (!BlockDev_ReadBlock(bd, rdb->block_num, buf)) {
+        IC_ERR("  READ FAILED");
+    } else if (buf[0] != IDNAME_RIGIDDISK) {
+        IC_ERRLINE("  ID WRONG: 0x%08lX (expected RDSK)", buf[0]);
+    } else {
+        IC_CHKSUM(buf[1], buf);
+        IC_LINE("  Geometry: %lu x %lu x %lu  cyls %lu-%lu",
+                (ULONG)rdb->cylinders, (ULONG)rdb->heads, (ULONG)rdb->sectors,
+                (ULONG)rdb->lo_cyl, (ULONG)rdb->hi_cyl);
+        IC_LINE("  RDB blocks: %lu-%lu",
+                rdb->rdb_block_lo, rdb->rdb_block_hi);
+        if (rdb->cylinders == 0 || rdb->heads == 0 || rdb->sectors == 0)
+            IC_ERR("  ERROR: zero geometry field");
+        if (rdb->lo_cyl > rdb->hi_cyl)
+            IC_ERRLINE("  ERROR: lo_cyl %lu > hi_cyl %lu",
+                       (ULONG)rdb->lo_cyl, (ULONG)rdb->hi_cyl);
+    }
+
+    /* --- PART blocks --- */
+    IC_OUT("");
+    IC_LINE("Partitions: %u", (unsigned)rdb->num_parts);
+    for (i = 0; i < rdb->num_parts; i++) {
+        const struct PartInfo *pi = &rdb->parts[i];
+        char dtbuf[16];
+        FormatDosType(pi->dos_type, dtbuf);
+        IC_LINE("  [%u] %-6s  blk %lu  cyls %lu-%lu  %s",
+                (unsigned)i, pi->drive_name, pi->block_num,
+                (ULONG)pi->low_cyl, (ULONG)pi->high_cyl, dtbuf);
+        if (!BlockDev_ReadBlock(bd, pi->block_num, buf)) {
+            IC_ERR("    READ FAILED"); continue;
+        }
+        if (buf[0] != IDNAME_PARTITION) {
+            IC_ERRLINE("    ID WRONG: 0x%08lX", buf[0]);
+        } else {
+            IC_CHKSUM(buf[1], buf);
+        }
+        if (pi->low_cyl > pi->high_cyl)
+            IC_ERRLINE("    ERROR: low_cyl %lu > high_cyl %lu",
+                       (ULONG)pi->low_cyl, (ULONG)pi->high_cyl);
+        if (pi->high_cyl > rdb->hi_cyl)
+            IC_ERRLINE("    WARN: high_cyl %lu > disk hi_cyl %lu",
+                       (ULONG)pi->high_cyl, (ULONG)rdb->hi_cyl);
+    }
+
+    /* Overlap check */
+    {
+        BOOL any = FALSE;
+        UWORD ai, bi;
+        for (ai = 0; ai < rdb->num_parts; ai++) {
+            for (bi = ai + 1; bi < rdb->num_parts; bi++) {
+                if (rdb->parts[ai].low_cyl  <= rdb->parts[bi].high_cyl &&
+                    rdb->parts[ai].high_cyl >= rdb->parts[bi].low_cyl) {
+                    IC_ERRLINE("  OVERLAP: %s (%lu-%lu) and %s (%lu-%lu)",
+                               rdb->parts[ai].drive_name,
+                               (ULONG)rdb->parts[ai].low_cyl,
+                               (ULONG)rdb->parts[ai].high_cyl,
+                               rdb->parts[bi].drive_name,
+                               (ULONG)rdb->parts[bi].low_cyl,
+                               (ULONG)rdb->parts[bi].high_cyl);
+                    any = TRUE;
+                }
+            }
+        }
+        if (!any)
+            IC_OUT("  Overlap check: PASS");
+    }
+
+    /* --- FSHD + LSEG blocks --- */
+    IC_OUT("");
+    IC_LINE("Filesystems: %u", (unsigned)rdb->num_fs);
+    for (i = 0; i < rdb->num_fs; i++) {
+        const struct FSInfo *fi = &rdb->filesystems[i];
+        char  dtbuf[16];
+        ULONG lseg_blk;
+        ULONG lseg_ok = 0, lseg_bad = 0;
+        ULONG lseg_seen[CHAIN_SEEN_MAX];
+        UWORD lseg_seen_n = 0;
+
+        FormatDosType(fi->dos_type, dtbuf);
+        IC_LINE("  [%u] %-8s  blk %lu", (unsigned)i, dtbuf, fi->block_num);
+
+        if (!BlockDev_ReadBlock(bd, fi->block_num, buf)) {
+            IC_ERR("    READ FAILED");
+        } else if (buf[0] != IDNAME_FSHEADER) {
+            IC_ERRLINE("    ID WRONG: 0x%08lX", buf[0]); errors++;
+        } else {
+            IC_CHKSUM(buf[1], buf);
+        }
+
+        lseg_blk = fi->seg_list_blk;
+        while (lseg_blk != RDB_END_MARK) {
+            if (chain_seen(lseg_seen, &lseg_seen_n, lseg_blk)) {
+                IC_ERRLINE("    LSEG LOOP at block %lu", lseg_blk);
+                errors++; break;
+            }
+            if (!BlockDev_ReadBlock(bd, lseg_blk, buf)) {
+                IC_ERRLINE("    LSEG blk %lu: READ FAILED", lseg_blk);
+                errors++; break;
+            }
+            if (buf[0] != IDNAME_LOADSEG) {
+                IC_ERRLINE("    LSEG blk %lu: ID WRONG 0x%08lX",
+                           lseg_blk, buf[0]);
+                lseg_bad++; errors++; break;
+            }
+            {
+                ULONG sl = buf[1];
+                if (sl >= 2 && sl <= 128) {
+                    ULONG sum = 0, k;
+                    for (k = 0; k < sl; k++) sum += buf[k];
+                    if (sum != 0) { lseg_bad++; errors++; }
+                    else lseg_ok++;
+                } else {
+                    lseg_ok++;
+                }
+            }
+            lseg_blk = buf[127];
+        }
+        if (lseg_bad > 0)
+            IC_LINE("    LSEG: %lu bad / %lu OK", lseg_bad, lseg_ok);
+        else if (fi->seg_list_blk != RDB_END_MARK)
+            IC_LINE("    LSEG: %lu blocks  OK", lseg_ok);
+        else
+            IC_OUT("    LSEG: (no code)");
+    }
+
+    /* Summary */
+    IC_OUT("");
+    IC_OUT("----------------------------");
+    if (errors == 0)
+        IC_OUT("Result: PASS  (no errors)");
+    else
+        IC_LINE("Result: FAIL  (%lu error(s))", errors);
+
+#undef IC_OUT
+#undef IC_LINE
+#undef IC_ERR
+#undef IC_ERRLINE
+#undef IC_CHKSUM
+
+    FreeVec(buf);
+    return errors;
+}
+
+/* ------------------------------------------------------------------ */
 /* Block checksum                                                       */
 /* Sum of all 128 longwords (including the checksum field) must = 0.   */
 /* Set checksum field to 0, compute, store -sum in checksum field.     */
@@ -816,10 +1064,11 @@ static void fill_lseg_chain(UBYTE *big_buf, ULONG base_blk, ULONG block_size,
 /*   +N+1 .. +N+F            = FileSysHeaderBlocks (F = num_fs)       */
 /*   +N+F+1 .. end           = LoadSegBlocks (filesystem code)        */
 /*                                                                      */
-/* All blocks are built into one contiguous MEMF_PUBLIC buffer and     */
-/* committed with a single CMD_WRITE — matching HDToolBox CommitChanges */
-/* which is the proven write approach on A3000 scsi.device.            */
-/* A post-write read-back pass then verifies each block separately.    */
+/* All blocks are built into one contiguous MEMF_PUBLIC buffer, then   */
+/* written one block at a time using TD_WRITE64.  A post-write         */
+/* read-back pass verifies each block separately.  The write is NOT    */
+/* atomic: a power failure or driver error mid-write leaves a partial  */
+/* RDB.  Use backup/restore to protect against that.                   */
 /* ------------------------------------------------------------------ */
 
 BOOL RDB_Write(struct BlockDev *bd, struct RDBInfo *rdb)
@@ -836,6 +1085,26 @@ BOOL RDB_Write(struct BlockDev *bd, struct RDBInfo *rdb)
     BYTE   err;
 
     if (!bd || !rdb || !rdb->valid) return FALSE;
+
+    /* Validate counts so write loops can never overrun their arrays */
+    if (rdb->num_parts > MAX_PARTITIONS || rdb->num_fs > MAX_FILESYSTEMS)
+        return FALSE;
+    { UWORD _i;
+      for (_i = 0; _i < rdb->num_parts; _i++) {
+          const struct PartInfo *pi = &rdb->parts[_i];
+          if (pi->low_cyl > pi->high_cyl) return FALSE;
+      }
+      /* Overlap check: O(n²) but n <= MAX_PARTITIONS (64) so it is fine */
+      for (_i = 0; _i < rdb->num_parts; _i++) {
+          UWORD _j;
+          for (_j = _i + 1; _j < rdb->num_parts; _j++) {
+              const struct PartInfo *a = &rdb->parts[_i];
+              const struct PartInfo *b = &rdb->parts[_j];
+              if (a->low_cyl <= b->high_cyl && b->low_cyl <= a->high_cyl)
+                  return FALSE;
+          }
+      }
+    }
 
     /* First partition block immediately after the RDB block */
     part_blk = rdb->rdb_block_lo + 1;

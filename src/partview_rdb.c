@@ -2,8 +2,9 @@
  * partview_rdb.c — RDB backup/restore/view and disk diagnostic tools.
  *
  * Contains: rdb_backup_block, rdb_restore_block, rdb_backup_extended,
- *           rdb_restore_extended, rdb_view_block, rdb_raw_scan,
- *           raw_disk_read, diag_read_block, raw_hex_dump.
+ *           rdb_restore_extended, rdb_verify_block, rdb_verify_extended,
+ *           rdb_view_block, rdb_raw_scan, raw_disk_read, diag_read_block,
+ *           raw_hex_dump, rdb_integrity_check.
  */
 
 #include <exec/types.h>
@@ -267,10 +268,6 @@ void rdb_restore_block(struct Window *win, struct BlockDev *bd)
 /*   hdr[4] = num_blocks                                              */
 /*   hdr[5..7] = reserved 0                                           */
 /* ------------------------------------------------------------------ */
-
-#define ERDB_MAGIC   0x45524442UL   /* 'ERDB' */
-#define ERDB_VERSION 1UL
-#define ERDB_HDR_SZ  32             /* 8 longwords */
 
 void rdb_backup_extended(struct Window *win, struct BlockDev *bd,
                                   struct RDBInfo *rdb)
@@ -579,7 +576,7 @@ void rdb_restore_extended(struct Window *win, struct BlockDev *bd)
 
 #define VRDB_LIST     1
 #define VRDB_DONE     2
-#define VRDB_MAXLINES 120
+#define VRDB_MAXLINES 400
 
 static char        vrdb_strs[VRDB_MAXLINES][80];
 static struct Node vrdb_nodes[VRDB_MAXLINES];
@@ -3152,5 +3149,512 @@ bbs_no_vrdb:
                 EasyRequest(win, &es, NULL);
             }
         }
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* rdb_integrity_check — validate all RDB block checksums and chains  */
+/* ------------------------------------------------------------------ */
+
+static void ic_vrdb_cb(void *ud, const char *line)
+{
+    (void)ud;
+    vrdb_add(line);
+}
+
+void rdb_integrity_check(struct Window *win, struct BlockDev *bd,
+                         const struct RDBInfo *rdb)
+{
+    struct EasyStruct es;
+
+    if (!bd || !rdb || !rdb->valid) {
+        es.es_StructSize=sizeof(es); es.es_Flags=0;
+        es.es_Title=(UBYTE*)"RDB Integrity Check";
+        es.es_TextFormat=(UBYTE*)"No device or RDB loaded.";
+        es.es_GadgetFormat=(UBYTE*)"OK";
+        EasyRequest(win, &es, NULL);
+        return;
+    }
+
+    vrdb_count = 0;
+    vrdb_list.lh_Head     = (struct Node *)&vrdb_list.lh_Tail;
+    vrdb_list.lh_Tail     = NULL;
+    vrdb_list.lh_TailPred = (struct Node *)&vrdb_list.lh_Head;
+
+    vrdb_add("--- RDB Integrity Check ---");
+    vrdb_add("");
+
+    RDB_IntegrityCheck(bd, rdb, ic_vrdb_cb, NULL);
+
+    /* Open display window */
+    {
+        struct Screen  *scr   = NULL;
+        APTR            vi    = NULL;
+        struct Gadget  *glist = NULL;
+        struct Window  *vwin  = NULL;
+        UWORD font_h, bor_t, bor_b, row_h, btn_h, pad, win_w, win_h, min_h;
+        UWORD scr_w, scr_h;
+
+        scr = LockPubScreen(NULL);
+        if (!scr) return;
+        vi = GetVisualInfoA(scr, NULL);
+        if (!vi) { UnlockPubScreen(NULL, scr); return; }
+
+        font_h = (UWORD)scr->Font->ta_YSize;
+        bor_t  = (UWORD)scr->WBorTop + font_h + 1;
+        bor_b  = (UWORD)scr->WBorBottom;
+        pad    = 4;
+        row_h  = font_h + 2;
+        btn_h  = font_h + 6;
+        win_w  = 520;
+        win_h  = bor_t + pad + row_h * 24 + pad + btn_h + pad + bor_b;
+        min_h  = bor_t + pad + row_h *  4 + pad + btn_h + pad + bor_b;
+        scr_w  = scr->Width;
+        scr_h  = scr->Height;
+
+        if (!vrdb_make_gadgets(vi, scr, win_w, win_h, &glist))
+            goto ic_cleanup;
+
+        { struct TagItem wt[] = {
+              { WA_Left,      (ULONG)((scr_w - win_w) / 2) },
+              { WA_Top,       (ULONG)((scr_h - win_h) / 2) },
+              { WA_Width,     win_w }, { WA_Height, win_h },
+              { WA_Title,     (ULONG)"RDB Integrity Check" },
+              { WA_Gadgets,   (ULONG)glist },
+              { WA_PubScreen, (ULONG)scr },
+              { WA_IDCMP,     IDCMP_CLOSEWINDOW|IDCMP_GADGETUP|
+                              IDCMP_REFRESHWINDOW|IDCMP_NEWSIZE },
+              { WA_Flags,     WFLG_DRAGBAR|WFLG_DEPTHGADGET|
+                              WFLG_CLOSEGADGET|WFLG_ACTIVATE|WFLG_SIMPLE_REFRESH|
+                              WFLG_SIZEGADGET|WFLG_SIZEBBOTTOM },
+              { WA_MinWidth,  300 },
+              { WA_MinHeight, min_h },
+              { WA_MaxWidth,  scr_w },
+              { WA_MaxHeight, scr_h },
+              { TAG_DONE, 0 } };
+          vwin = OpenWindowTagList(NULL, wt); }
+
+        UnlockPubScreen(NULL, scr); scr = NULL;
+        if (!vwin) goto ic_cleanup;
+        GT_RefreshWindow(vwin, NULL);
+
+        { BOOL running = TRUE;
+          while (running) {
+              struct IntuiMessage *imsg;
+              WaitPort(vwin->UserPort);
+              while ((imsg = GT_GetIMsg(vwin->UserPort)) != NULL) {
+                  ULONG iclass = imsg->Class;
+                  struct Gadget *gad = (struct Gadget *)imsg->IAddress;
+                  GT_ReplyIMsg(imsg);
+                  switch (iclass) {
+                  case IDCMP_CLOSEWINDOW: running = FALSE; break;
+                  case IDCMP_NEWSIZE: {
+                      struct Gadget *ng2 = NULL;
+                      RemoveGList(vwin, glist, -1);
+                      FreeGadgets(glist); glist = NULL;
+                      if (vrdb_make_gadgets(vi, vwin->WScreen,
+                                            (UWORD)vwin->Width,
+                                            (UWORD)vwin->Height, &ng2)) {
+                          glist = ng2;
+                          AddGList(vwin, glist, ~0, -1, NULL);
+                          RefreshGList(glist, vwin, NULL, -1);
+                      }
+                      GT_RefreshWindow(vwin, NULL);
+                      break; }
+                  case IDCMP_REFRESHWINDOW:
+                      GT_BeginRefresh(vwin); GT_EndRefresh(vwin, TRUE); break;
+                  case IDCMP_GADGETUP:
+                      if (gad->GadgetID == VRDB_DONE) running = FALSE; break;
+                  }
+              }
+          }
+        }
+
+ic_cleanup:
+        if (vwin)  { RemoveGList(vwin, glist, -1); CloseWindow(vwin); }
+        if (glist)   FreeGadgets(glist);
+        if (vi)      FreeVisualInfo(vi);
+        if (scr)     UnlockPubScreen(NULL, scr);
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* rdb_verify_block — compare backup file to RDB block on disk        */
+/* ------------------------------------------------------------------ */
+
+void rdb_verify_block(struct Window *win, struct BlockDev *bd,
+                      const struct RDBInfo *rdb)
+{
+    struct EasyStruct es;
+    UBYTE *fbuf = NULL, *dbuf = NULL;
+    static char load_path[256];
+    BPTR  fh;
+    LONG  fsize;
+    ULONG i, first_diff = 0xFFFFFFFFUL, diff_count = 0;
+    char  msg[160];
+
+    if (!bd) {
+        es.es_StructSize=sizeof(es); es.es_Flags=0;
+        es.es_Title=(UBYTE*)"Verify RDB Block";
+        es.es_TextFormat=(UBYTE*)"Device is not accessible.";
+        es.es_GadgetFormat=(UBYTE*)"OK";
+        EasyRequest(win, &es, NULL); return;
+    }
+    if (!rdb || !rdb->valid) {
+        es.es_StructSize=sizeof(es); es.es_Flags=0;
+        es.es_Title=(UBYTE*)"Verify RDB Block";
+        es.es_TextFormat=(UBYTE*)"No RDB found on this disk.";
+        es.es_GadgetFormat=(UBYTE*)"OK";
+        EasyRequest(win, &es, NULL); return;
+    }
+
+    if (!AslBase) {
+        es.es_StructSize=sizeof(es); es.es_Flags=0;
+        es.es_Title=(UBYTE*)"Verify RDB Block";
+        es.es_TextFormat=(UBYTE*)"asl.library not available.\nCannot open file requester.";
+        es.es_GadgetFormat=(UBYTE*)"OK";
+        EasyRequest(win, &es, NULL); return;
+    }
+
+    { struct FileRequester *fr; BOOL chosen = FALSE;
+      { struct TagItem at[] = {
+            { ASLFR_TitleText,    (ULONG)"Select RDB Block Backup to Verify" },
+            { ASLFR_InitialDrawer,(ULONG)"RAM:" },
+            { ASLFR_InitialFile,  (ULONG)"RDB.backup" },
+            { TAG_DONE, 0 } };
+        fr = (struct FileRequester *)AllocAslRequest(ASL_FileRequest, at); }
+      if (fr) {
+          if (AslRequest(fr, NULL)) {
+              strncpy(load_path, fr->fr_Drawer, sizeof(load_path)-1);
+              load_path[sizeof(load_path)-1] = '\0';
+              AddPart((UBYTE *)load_path, (UBYTE *)fr->fr_File, sizeof(load_path));
+              chosen = TRUE;
+          }
+          FreeAslRequest(fr);
+      }
+      if (!chosen) return;
+    }
+
+    fh = Open((UBYTE *)load_path, MODE_OLDFILE);
+    if (!fh) {
+        es.es_StructSize=sizeof(es); es.es_Flags=0;
+        es.es_Title=(UBYTE*)"Verify RDB Block";
+        es.es_TextFormat=(UBYTE*)"Cannot open backup file.";
+        es.es_GadgetFormat=(UBYTE*)"OK";
+        EasyRequest(win, &es, NULL); return;
+    }
+
+    Seek(fh, 0, OFFSET_END);
+    fsize = Seek(fh, 0, OFFSET_BEGINNING);
+
+    if (fsize != (LONG)bd->block_size) {
+        Close(fh);
+        sprintf(msg, "File size (%ld) does not match\ndevice block size (%lu). Aborted.",
+                (long)fsize, (unsigned long)bd->block_size);
+        es.es_StructSize=sizeof(es); es.es_Flags=0;
+        es.es_Title=(UBYTE*)"Verify RDB Block";
+        es.es_TextFormat=(UBYTE*)msg;
+        es.es_GadgetFormat=(UBYTE*)"OK";
+        EasyRequest(win, &es, NULL); return;
+    }
+
+    fbuf = (UBYTE *)AllocVec(bd->block_size, MEMF_PUBLIC | MEMF_CLEAR);
+    dbuf = (UBYTE *)AllocVec(bd->block_size, MEMF_PUBLIC | MEMF_CLEAR);
+    if (!fbuf || !dbuf) {
+        Close(fh);
+        if (fbuf) FreeVec(fbuf);
+        if (dbuf) FreeVec(dbuf);
+        return;
+    }
+
+    if (Read(fh, fbuf, fsize) != fsize) {
+        Close(fh); FreeVec(fbuf); FreeVec(dbuf);
+        es.es_StructSize=sizeof(es); es.es_Flags=0;
+        es.es_Title=(UBYTE*)"Verify RDB Block";
+        es.es_TextFormat=(UBYTE*)"File read error.";
+        es.es_GadgetFormat=(UBYTE*)"OK";
+        EasyRequest(win, &es, NULL); return;
+    }
+    Close(fh);
+
+    if (!BlockDev_ReadBlock(bd, rdb->block_num, dbuf)) {
+        FreeVec(fbuf); FreeVec(dbuf);
+        es.es_StructSize=sizeof(es); es.es_Flags=0;
+        es.es_Title=(UBYTE*)"Verify RDB Block";
+        es.es_TextFormat=(UBYTE*)"Failed to read RDB block from disk.";
+        es.es_GadgetFormat=(UBYTE*)"OK";
+        EasyRequest(win, &es, NULL); return;
+    }
+
+    for (i = 0; i < bd->block_size; i++) {
+        if (fbuf[i] != dbuf[i]) {
+            if (first_diff == 0xFFFFFFFFUL) first_diff = i;
+            diff_count++;
+        }
+    }
+
+    if (diff_count == 0) {
+        sprintf(msg, "MATCH\n\nBackup file matches RDB block %lu on disk.\n(%lu bytes compared)",
+                (unsigned long)rdb->block_num, (unsigned long)bd->block_size);
+    } else {
+        sprintf(msg, "MISMATCH\n\n%lu byte(s) differ.\nFirst difference at offset %lu (0x%04lX).",
+                (unsigned long)diff_count,
+                (unsigned long)first_diff,
+                (unsigned long)first_diff);
+    }
+    es.es_StructSize=sizeof(es); es.es_Flags=0;
+    es.es_Title=(UBYTE*)"Verify RDB Block";
+    es.es_TextFormat=(UBYTE*)msg;
+    es.es_GadgetFormat=(UBYTE*)"OK";
+    EasyRequest(win, &es, NULL);
+
+    FreeVec(fbuf); FreeVec(dbuf);
+}
+
+/* ------------------------------------------------------------------ */
+/* rdb_verify_extended — compare extended backup file to disk blocks  */
+/* ------------------------------------------------------------------ */
+
+void rdb_verify_extended(struct Window *win, struct BlockDev *bd)
+{
+    struct EasyStruct es;
+    static char load_path[256];
+    UBYTE *fbuf = NULL, *dbuf = NULL;
+    BPTR   fh;
+    ULONG  hdr[8];
+    ULONG  block_lo, block_size, num_blocks, blk;
+    ULONG  total_diff = 0, bad_blocks = 0;
+    char   line[80];
+
+    if (!bd) {
+        es.es_StructSize=sizeof(es); es.es_Flags=0;
+        es.es_Title=(UBYTE*)"Verify Extended Backup";
+        es.es_TextFormat=(UBYTE*)"Device is not accessible.";
+        es.es_GadgetFormat=(UBYTE*)"OK";
+        EasyRequest(win, &es, NULL); return;
+    }
+
+    if (!AslBase) {
+        es.es_StructSize=sizeof(es); es.es_Flags=0;
+        es.es_Title=(UBYTE*)"Verify Extended Backup";
+        es.es_TextFormat=(UBYTE*)"asl.library not available.\nCannot open file requester.";
+        es.es_GadgetFormat=(UBYTE*)"OK";
+        EasyRequest(win, &es, NULL); return;
+    }
+
+    { struct FileRequester *fr; BOOL chosen = FALSE;
+      { struct TagItem at[] = {
+            { ASLFR_TitleText,    (ULONG)"Select Extended Backup File to Verify" },
+            { ASLFR_InitialDrawer,(ULONG)"RAM:" },
+            { TAG_DONE, 0 } };
+        fr = (struct FileRequester *)AllocAslRequest(ASL_FileRequest, at); }
+      if (fr) {
+          if (AslRequest(fr, NULL)) {
+              strncpy(load_path, fr->fr_Drawer, sizeof(load_path)-1);
+              load_path[sizeof(load_path)-1] = '\0';
+              AddPart((UBYTE *)load_path, (UBYTE *)fr->fr_File, sizeof(load_path));
+              chosen = TRUE;
+          }
+          FreeAslRequest(fr);
+      }
+      if (!chosen) return;
+    }
+
+    fh = Open((UBYTE *)load_path, MODE_OLDFILE);
+    if (!fh) {
+        es.es_StructSize=sizeof(es); es.es_Flags=0;
+        es.es_Title=(UBYTE*)"Verify Extended Backup";
+        es.es_TextFormat=(UBYTE*)"Cannot open backup file.";
+        es.es_GadgetFormat=(UBYTE*)"OK";
+        EasyRequest(win, &es, NULL); return;
+    }
+
+    if (Read(fh, hdr, ERDB_HDR_SZ) != ERDB_HDR_SZ ||
+        hdr[0] != ERDB_MAGIC || hdr[1] != ERDB_VERSION) {
+        Close(fh);
+        es.es_StructSize=sizeof(es); es.es_Flags=0;
+        es.es_Title=(UBYTE*)"Verify Extended Backup";
+        es.es_TextFormat=(UBYTE*)"Not a valid ERDB backup file\n(bad magic or version).";
+        es.es_GadgetFormat=(UBYTE*)"OK";
+        EasyRequest(win, &es, NULL); return;
+    }
+
+    block_lo   = hdr[2];
+    block_size = hdr[3];
+    num_blocks = hdr[4];
+
+    if (block_size != bd->block_size) {
+        Close(fh);
+        { char msg[120];
+          sprintf(msg, "Block size mismatch:\nbackup=%lu, device=%lu. Aborted.",
+                  (unsigned long)block_size, (unsigned long)bd->block_size);
+          es.es_StructSize=sizeof(es); es.es_Flags=0;
+          es.es_Title=(UBYTE*)"Verify Extended Backup";
+          es.es_TextFormat=(UBYTE*)msg;
+          es.es_GadgetFormat=(UBYTE*)"OK";
+          EasyRequest(win, &es, NULL); }
+        return;
+    }
+
+    if (num_blocks == 0 || num_blocks > 1024) {
+        Close(fh);
+        es.es_StructSize=sizeof(es); es.es_Flags=0;
+        es.es_Title=(UBYTE*)"Verify Extended Backup";
+        es.es_TextFormat=(UBYTE*)"Unreasonable block count in header. Aborted.";
+        es.es_GadgetFormat=(UBYTE*)"OK";
+        EasyRequest(win, &es, NULL); return;
+    }
+
+    fbuf = (UBYTE *)AllocVec(block_size, MEMF_PUBLIC | MEMF_CLEAR);
+    dbuf = (UBYTE *)AllocVec(block_size, MEMF_PUBLIC | MEMF_CLEAR);
+    if (!fbuf || !dbuf) {
+        Close(fh);
+        if (fbuf) FreeVec(fbuf);
+        if (dbuf) FreeVec(dbuf);
+        return;
+    }
+
+    vrdb_count = 0;
+    vrdb_list.lh_Head     = (struct Node *)&vrdb_list.lh_Tail;
+    vrdb_list.lh_Tail     = NULL;
+    vrdb_list.lh_TailPred = (struct Node *)&vrdb_list.lh_Head;
+
+    sprintf(line, "--- Verify Extended Backup: %lu blocks from blk %lu ---",
+            (unsigned long)num_blocks, (unsigned long)block_lo);
+    vrdb_add(line);
+    vrdb_add("");
+
+    for (blk = 0; blk < num_blocks; blk++) {
+        ULONG disk_blk = block_lo + blk;
+        ULONG i, diff = 0;
+
+        if (Read(fh, fbuf, (LONG)block_size) != (LONG)block_size) {
+            sprintf(line, "Blk %lu: FILE READ ERROR", (unsigned long)disk_blk);
+            vrdb_add(line); bad_blocks++; break;
+        }
+        if (!BlockDev_ReadBlock(bd, disk_blk, dbuf)) {
+            sprintf(line, "Blk %lu: DISK READ ERROR", (unsigned long)disk_blk);
+            vrdb_add(line); bad_blocks++; continue;
+        }
+        for (i = 0; i < block_size; i++) {
+            if (fbuf[i] != dbuf[i]) diff++;
+        }
+        if (diff == 0) {
+            sprintf(line, "Blk %lu: MATCH", (unsigned long)disk_blk);
+        } else {
+            ULONG first = 0;
+            for (first = 0; first < block_size; first++)
+                if (fbuf[first] != dbuf[first]) break;
+            sprintf(line, "Blk %lu: MISMATCH  %lu byte(s) differ, first @ 0x%04lX",
+                    (unsigned long)disk_blk,
+                    (unsigned long)diff,
+                    (unsigned long)first);
+            bad_blocks++;
+        }
+        total_diff += diff;
+        vrdb_add(line);
+    }
+    Close(fh);
+    FreeVec(fbuf); FreeVec(dbuf);
+
+    vrdb_add("");
+    if (bad_blocks == 0) {
+        sprintf(line, "RESULT: PASS  All %lu blocks match.",
+                (unsigned long)num_blocks);
+    } else {
+        sprintf(line, "RESULT: FAIL  %lu/%lu blocks have differences.",
+                (unsigned long)bad_blocks, (unsigned long)num_blocks);
+    }
+    vrdb_add(line);
+
+    /* Open display window */
+    {
+        struct Screen  *scr   = NULL;
+        APTR            vi    = NULL;
+        struct Gadget  *glist = NULL;
+        struct Window  *vwin  = NULL;
+        UWORD font_h, bor_t, bor_b, row_h, btn_h, pad, win_w, win_h, min_h;
+        UWORD scr_w, scr_h;
+
+        scr = LockPubScreen(NULL);
+        if (!scr) return;
+        vi = GetVisualInfoA(scr, NULL);
+        if (!vi) { UnlockPubScreen(NULL, scr); return; }
+
+        font_h = (UWORD)scr->Font->ta_YSize;
+        bor_t  = (UWORD)scr->WBorTop + font_h + 1;
+        bor_b  = (UWORD)scr->WBorBottom;
+        pad    = 4;
+        row_h  = font_h + 2;
+        btn_h  = font_h + 6;
+        win_w  = 520;
+        win_h  = bor_t + pad + row_h * 20 + pad + btn_h + pad + bor_b;
+        min_h  = bor_t + pad + row_h *  4 + pad + btn_h + pad + bor_b;
+        scr_w  = scr->Width;
+        scr_h  = scr->Height;
+
+        if (!vrdb_make_gadgets(vi, scr, win_w, win_h, &glist))
+            goto ve_cleanup;
+
+        { struct TagItem wt[] = {
+              { WA_Left,      (ULONG)((scr_w - win_w) / 2) },
+              { WA_Top,       (ULONG)((scr_h - win_h) / 2) },
+              { WA_Width,     win_w }, { WA_Height, win_h },
+              { WA_Title,     (ULONG)"Verify Extended Backup" },
+              { WA_Gadgets,   (ULONG)glist },
+              { WA_PubScreen, (ULONG)scr },
+              { WA_IDCMP,     IDCMP_CLOSEWINDOW|IDCMP_GADGETUP|
+                              IDCMP_REFRESHWINDOW|IDCMP_NEWSIZE },
+              { WA_Flags,     WFLG_DRAGBAR|WFLG_DEPTHGADGET|
+                              WFLG_CLOSEGADGET|WFLG_ACTIVATE|WFLG_SIMPLE_REFRESH|
+                              WFLG_SIZEGADGET|WFLG_SIZEBBOTTOM },
+              { WA_MinWidth,  300 },
+              { WA_MinHeight, min_h },
+              { WA_MaxWidth,  scr_w },
+              { WA_MaxHeight, scr_h },
+              { TAG_DONE, 0 } };
+          vwin = OpenWindowTagList(NULL, wt); }
+
+        UnlockPubScreen(NULL, scr); scr = NULL;
+        if (!vwin) goto ve_cleanup;
+        GT_RefreshWindow(vwin, NULL);
+
+        { BOOL running = TRUE;
+          while (running) {
+              struct IntuiMessage *imsg;
+              WaitPort(vwin->UserPort);
+              while ((imsg = GT_GetIMsg(vwin->UserPort)) != NULL) {
+                  ULONG iclass = imsg->Class;
+                  struct Gadget *gad = (struct Gadget *)imsg->IAddress;
+                  GT_ReplyIMsg(imsg);
+                  switch (iclass) {
+                  case IDCMP_CLOSEWINDOW: running = FALSE; break;
+                  case IDCMP_NEWSIZE: {
+                      struct Gadget *ng2 = NULL;
+                      RemoveGList(vwin, glist, -1);
+                      FreeGadgets(glist); glist = NULL;
+                      if (vrdb_make_gadgets(vi, vwin->WScreen,
+                                            (UWORD)vwin->Width,
+                                            (UWORD)vwin->Height, &ng2)) {
+                          glist = ng2;
+                          AddGList(vwin, glist, ~0, -1, NULL);
+                          RefreshGList(glist, vwin, NULL, -1);
+                      }
+                      GT_RefreshWindow(vwin, NULL);
+                      break; }
+                  case IDCMP_REFRESHWINDOW:
+                      GT_BeginRefresh(vwin); GT_EndRefresh(vwin, TRUE); break;
+                  case IDCMP_GADGETUP:
+                      if (gad->GadgetID == VRDB_DONE) running = FALSE; break;
+                  }
+              }
+          }
+        }
+
+ve_cleanup:
+        if (vwin)  { RemoveGList(vwin, glist, -1); CloseWindow(vwin); }
+        if (glist)   FreeGadgets(glist);
+        if (vi)      FreeVisualInfo(vi);
+        if (scr)     UnlockPubScreen(NULL, scr);
     }
 }

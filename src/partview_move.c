@@ -300,6 +300,12 @@ static void draw_move_warn_text(struct Window *pw,
     WTEXT("POWER LOSS OR CRASH DURING THIS PROCESS WILL")
     WTEXT("PERMANENTLY DESTROY YOUR DATA.  No rollback.")
 
+    y = (WORD)(y + lh / 2);
+
+    WTEXT("THIS WILL TAKE A VERY LONG TIME - PLAN FOR HOURS.")
+    WTEXT("1 GB ~ 20-60 min.  Large disks may take MUCH longer.")
+    WTEXT("Do NOT power off, interrupt or close DiskPart!")
+
 #undef WTEXT
 }
 
@@ -347,8 +353,8 @@ BOOL offer_move_partition(struct Window *win,
     inner_w = 420;
     win_w   = (UWORD)(bor_l + inner_w + scr->WBorRight);
 
-    /* 5 warning text lines + 2 half-gaps */
-    warn_h  = (UWORD)((5 + 1) * (font_h + 2) + pad * 2 + (font_h + 2));
+    /* 8 warning text lines + 3 half-gaps */
+    warn_h  = (UWORD)((8 + 2) * (font_h + 2) + pad * 2 + (font_h + 2));
 
     str_y = (UWORD)(bor_t + warn_h);
     chk_y = (UWORD)(str_y + row_h + pad);

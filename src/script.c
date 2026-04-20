@@ -9,6 +9,10 @@
  *   OPEN <device> <unit>
  *   INIT NEW | NEWGEO
  *   ADDPART NAME=<n> LOW=<cyl> HIGH=<cyl> [TYPE=<t>] [BOOTPRI=<n>] [BOOTABLE]
+ *   DELPART NAME=<n>
+ *   CHECKRDB
+ *   VERIFYRDB FILE=<path>
+ *   VERIFYEXT FILE=<path>
  *   ADDFS TYPE=<t> [VERSION=<hex>] [FILE=<path>] [STACKSIZE=<n>]
  *   WRITE
  *   INFO
@@ -541,6 +545,245 @@ static LONG do_addpart(ULONG ln, char **tok, UWORD ntok)
 }
 
 /* ------------------------------------------------------------------ */
+/* DELPART                                                             */
+/* ------------------------------------------------------------------ */
+
+static LONG do_delpart(ULONG ln, char **tok, UWORD ntok)
+{
+    const char *v;
+    char  name[32];
+    UWORD nlen, i, j;
+
+    if (!s_st.bd)
+        { sc_err(ln, "No device open. Use OPEN first."); return RETURN_ERROR; }
+    if (!s_st.rdb_ready || !s_st.rdb.valid)
+        { sc_err(ln, "No RDB. Use OPEN or INIT NEW first."); return RETURN_ERROR; }
+
+    v = kwarg(tok, ntok, "NAME");
+    if (!v || !v[0]) {
+        sc_err(ln, "DELPART requires NAME=<drivename>.");
+        return RETURN_ERROR;
+    }
+    strncpy(name, v, 30); name[30] = '\0';
+    nlen = (UWORD)strlen(name);
+    if (nlen > 0 && name[nlen - 1] == ':') name[--nlen] = '\0';
+    if (nlen == 0) { sc_err(ln, "DELPART: NAME is empty."); return RETURN_ERROR; }
+
+    for (i = 0; i < s_st.rdb.num_parts; i++) {
+        if (ci_eq(s_st.rdb.parts[i].drive_name, name)) {
+            sprintf(s_msg, "  Deleted: %-6s  cyls %lu-%lu\n",
+                    s_st.rdb.parts[i].drive_name,
+                    (ULONG)s_st.rdb.parts[i].low_cyl,
+                    (ULONG)s_st.rdb.parts[i].high_cyl);
+            for (j = i; j + 1 < s_st.rdb.num_parts; j++)
+                s_st.rdb.parts[j] = s_st.rdb.parts[j + 1];
+            s_st.rdb.num_parts--;
+            s_st.dirty = TRUE;
+            sc_puts(s_msg);
+            return RETURN_OK;
+        }
+    }
+
+    sprintf(s_msg, "DELPART: partition \"%s\" not found.", name);
+    sc_err(ln, s_msg);
+    return RETURN_ERROR;
+}
+
+/* ------------------------------------------------------------------ */
+/* CHECKRDB                                                            */
+/* ------------------------------------------------------------------ */
+
+static void checkrdb_cb(void *ud, const char *line)
+{
+    char buf[82];
+    (void)ud;
+    sprintf(buf, "%s\n", line);
+    sc_puts(buf);
+}
+
+static LONG do_checkrdb(ULONG ln)
+{
+    ULONG errs;
+
+    if (!s_st.bd)
+        { sc_err(ln, "No device open. Use OPEN first."); return RETURN_ERROR; }
+    if (!s_st.rdb_ready || !s_st.rdb.valid)
+        { sc_err(ln, "No RDB. Use OPEN or INIT NEW first."); return RETURN_ERROR; }
+
+    errs = RDB_IntegrityCheck(s_st.bd, &s_st.rdb, checkrdb_cb, NULL);
+    return (errs == 0) ? RETURN_OK : RETURN_WARN;
+}
+
+/* ------------------------------------------------------------------ */
+/* VERIFYRDB — compare single-block backup file to RDB block on disk  */
+/* ------------------------------------------------------------------ */
+
+static LONG do_verifyrdb(ULONG ln, char **tok, UWORD ntok)
+{
+    const char *path;
+    BPTR  fh;
+    LONG  fsize;
+    UBYTE *fbuf = NULL, *dbuf = NULL;
+    ULONG i, diff_count = 0, first_diff = 0xFFFFFFFFUL;
+
+    if (!s_st.bd)
+        { sc_err(ln, "No device open. Use OPEN first."); return RETURN_ERROR; }
+    if (!s_st.rdb_ready || !s_st.rdb.valid)
+        { sc_err(ln, "No RDB. Use OPEN first."); return RETURN_ERROR; }
+
+    path = kwarg(tok, ntok, "FILE");
+    if (!path || !path[0])
+        { sc_err(ln, "VERIFYRDB requires FILE=<path>."); return RETURN_ERROR; }
+
+    fh = Open((UBYTE *)path, MODE_OLDFILE);
+    if (!fh) { sc_err(ln, "VERIFYRDB: Cannot open file."); return RETURN_ERROR; }
+    Seek(fh, 0, OFFSET_END);
+    fsize = Seek(fh, 0, OFFSET_BEGINNING);
+
+    if (fsize != (LONG)s_st.bd->block_size) {
+        Close(fh);
+        sprintf(s_msg, "VERIFYRDB: File size (%ld) != block size (%lu).",
+                (long)fsize, (unsigned long)s_st.bd->block_size);
+        sc_err(ln, s_msg); return RETURN_ERROR;
+    }
+
+    fbuf = (UBYTE *)AllocVec(s_st.bd->block_size, MEMF_PUBLIC | MEMF_CLEAR);
+    dbuf = (UBYTE *)AllocVec(s_st.bd->block_size, MEMF_PUBLIC | MEMF_CLEAR);
+    if (!fbuf || !dbuf) {
+        Close(fh);
+        if (fbuf) FreeVec(fbuf); if (dbuf) FreeVec(dbuf);
+        return RETURN_ERROR;
+    }
+
+    if (Read(fh, fbuf, fsize) != fsize) {
+        Close(fh); FreeVec(fbuf); FreeVec(dbuf);
+        sc_err(ln, "VERIFYRDB: File read error."); return RETURN_ERROR;
+    }
+    Close(fh);
+
+    if (!BlockDev_ReadBlock(s_st.bd, s_st.rdb.block_num, dbuf)) {
+        FreeVec(fbuf); FreeVec(dbuf);
+        sc_err(ln, "VERIFYRDB: Cannot read RDB block from disk."); return RETURN_ERROR;
+    }
+
+    for (i = 0; i < s_st.bd->block_size; i++) {
+        if (fbuf[i] != dbuf[i]) {
+            if (first_diff == 0xFFFFFFFFUL) first_diff = i;
+            diff_count++;
+        }
+    }
+    FreeVec(fbuf); FreeVec(dbuf);
+
+    if (diff_count == 0) {
+        sc_puts("VERIFYRDB: MATCH\n"); return RETURN_OK;
+    } else {
+        sprintf(s_msg, "VERIFYRDB: MISMATCH — %lu byte(s) differ, first @ offset %lu.\n",
+                (unsigned long)diff_count, (unsigned long)first_diff);
+        sc_puts(s_msg);
+        return RETURN_WARN;
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* VERIFYEXT — compare extended backup file to disk blocks            */
+/* ------------------------------------------------------------------ */
+
+static LONG do_verifyext(ULONG ln, char **tok, UWORD ntok)
+{
+    const char *path;
+    BPTR   fh;
+    ULONG  hdr[8];
+    ULONG  block_lo, block_size, num_blocks, blk;
+    ULONG  bad_blocks = 0;
+    UBYTE *fbuf = NULL, *dbuf = NULL;
+
+    if (!s_st.bd)
+        { sc_err(ln, "No device open. Use OPEN first."); return RETURN_ERROR; }
+
+    path = kwarg(tok, ntok, "FILE");
+    if (!path || !path[0])
+        { sc_err(ln, "VERIFYEXT requires FILE=<path>."); return RETURN_ERROR; }
+
+    fh = Open((UBYTE *)path, MODE_OLDFILE);
+    if (!fh) { sc_err(ln, "VERIFYEXT: Cannot open file."); return RETURN_ERROR; }
+
+    if (Read(fh, hdr, ERDB_HDR_SZ) != ERDB_HDR_SZ ||
+        hdr[0] != ERDB_MAGIC || hdr[1] != ERDB_VERSION) {
+        Close(fh);
+        sc_err(ln, "VERIFYEXT: Not a valid ERDB backup (bad magic/version).");
+        return RETURN_ERROR;
+    }
+
+    block_lo   = hdr[2];
+    block_size = hdr[3];
+    num_blocks = hdr[4];
+
+    if (block_size != s_st.bd->block_size) {
+        Close(fh);
+        sprintf(s_msg, "VERIFYEXT: Block size mismatch: backup=%lu, device=%lu.",
+                (unsigned long)block_size, (unsigned long)s_st.bd->block_size);
+        sc_err(ln, s_msg); return RETURN_ERROR;
+    }
+    if (num_blocks == 0 || num_blocks > 1024) {
+        Close(fh);
+        sc_err(ln, "VERIFYEXT: Unreasonable block count in header.");
+        return RETURN_ERROR;
+    }
+
+    fbuf = (UBYTE *)AllocVec(block_size, MEMF_PUBLIC | MEMF_CLEAR);
+    dbuf = (UBYTE *)AllocVec(block_size, MEMF_PUBLIC | MEMF_CLEAR);
+    if (!fbuf || !dbuf) {
+        Close(fh);
+        if (fbuf) FreeVec(fbuf); if (dbuf) FreeVec(dbuf);
+        return RETURN_ERROR;
+    }
+
+    sprintf(s_msg, "VERIFYEXT: Checking %lu blocks from block %lu...\n",
+            (unsigned long)num_blocks, (unsigned long)block_lo);
+    sc_puts(s_msg);
+
+    for (blk = 0; blk < num_blocks; blk++) {
+        ULONG disk_blk = block_lo + blk;
+        ULONG i, diff = 0;
+
+        if (Read(fh, fbuf, (LONG)block_size) != (LONG)block_size) {
+            sprintf(s_msg, "  Blk %lu: FILE READ ERROR\n", (unsigned long)disk_blk);
+            sc_puts(s_msg); bad_blocks++; break;
+        }
+        if (!BlockDev_ReadBlock(s_st.bd, disk_blk, dbuf)) {
+            sprintf(s_msg, "  Blk %lu: DISK READ ERROR\n", (unsigned long)disk_blk);
+            sc_puts(s_msg); bad_blocks++; continue;
+        }
+        for (i = 0; i < block_size; i++)
+            if (fbuf[i] != dbuf[i]) diff++;
+
+        if (diff == 0) {
+            sprintf(s_msg, "  Blk %lu: MATCH\n", (unsigned long)disk_blk);
+        } else {
+            ULONG first = 0;
+            for (first = 0; first < block_size; first++)
+                if (fbuf[first] != dbuf[first]) break;
+            sprintf(s_msg, "  Blk %lu: MISMATCH  %lu byte(s), first @ 0x%04lX\n",
+                    (unsigned long)disk_blk, (unsigned long)diff, (unsigned long)first);
+            bad_blocks++;
+        }
+        sc_puts(s_msg);
+    }
+    Close(fh);
+    FreeVec(fbuf); FreeVec(dbuf);
+
+    if (bad_blocks == 0) {
+        sprintf(s_msg, "VERIFYEXT: PASS  All %lu blocks match.\n",
+                (unsigned long)num_blocks);
+        sc_puts(s_msg); return RETURN_OK;
+    } else {
+        sprintf(s_msg, "VERIFYEXT: FAIL  %lu/%lu blocks have differences.\n",
+                (unsigned long)bad_blocks, (unsigned long)num_blocks);
+        sc_puts(s_msg); return RETURN_WARN;
+    }
+}
+
+/* ------------------------------------------------------------------ */
 /* ADDFS                                                               */
 /* ------------------------------------------------------------------ */
 
@@ -831,7 +1074,11 @@ static LONG run_line(char *line, ULONG ln)
     if (ci_eq(tok[0], "OPEN"))    return do_open(ln, tok, ntok);
     if (ci_eq(tok[0], "INIT"))    return do_init(ln, tok, ntok);
     if (ci_eq(tok[0], "ADDPART")) return do_addpart(ln, tok, ntok);
-    if (ci_eq(tok[0], "ADDFS"))   return do_addfs(ln, tok, ntok);
+    if (ci_eq(tok[0], "DELPART"))   return do_delpart(ln, tok, ntok);
+    if (ci_eq(tok[0], "CHECKRDB")) return do_checkrdb(ln);
+    if (ci_eq(tok[0], "VERIFYRDB")) return do_verifyrdb(ln, tok, ntok);
+    if (ci_eq(tok[0], "VERIFYEXT")) return do_verifyext(ln, tok, ntok);
+    if (ci_eq(tok[0], "ADDFS"))    return do_addfs(ln, tok, ntok);
     if (ci_eq(tok[0], "WRITE"))   return do_write(ln);
     if (ci_eq(tok[0], "INFO"))    return do_info(ln);
     if (ci_eq(tok[0], "CLOSE"))   return do_close(ln);

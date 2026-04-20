@@ -422,7 +422,7 @@ cleanup:
 /* ------------------------------------------------------------------ */
 
 BOOL partition_dialog(struct PartInfo *pi, const char *title,
-                             const struct RDBInfo *rdb)
+                             const struct RDBInfo *rdb, BOOL is_new)
 {
     struct Screen  *scr          = NULL;
     APTR            vi           = NULL;
@@ -701,7 +701,8 @@ BOOL partition_dialog(struct PartInfo *pi, const char *title,
                         ULONG old_block_size = pi->block_size > 0 ? pi->block_size : 512;
                         ULONG new_dos_type   = dlg_fs_dostypes[cur_fs];
                         ULONG new_block_size = blocksize_values[cur_bsz];
-                        BOOL  destructive    = (new_dos_type   != old_dos_type ||
+                        BOOL  destructive    = !is_new &&
+                                               (new_dos_type   != old_dos_type ||
                                                 new_block_size != old_block_size);
                         if (destructive) {
                             struct EasyStruct es = {
@@ -825,7 +826,9 @@ void show_about(struct Window *win)
 #define GDLG_SECS    3
 #define GDLG_OK      4
 #define GDLG_CANCEL  5
-#define GDLG_ROWS    3
+#define GDLG_SIZE    6
+#define GDLG_CALC    7
+#define GDLG_ROWS    4   /* 3 CHS rows + 1 size row */
 
 BOOL geometry_dialog(ULONG def_cyls, ULONG def_heads, ULONG def_secs,
                             ULONG *out_cyls, ULONG *out_heads, ULONG *out_secs)
@@ -837,11 +840,13 @@ BOOL geometry_dialog(ULONG def_cyls, ULONG def_heads, ULONG def_secs,
     struct Gadget  *cyls_gad  = NULL;
     struct Gadget  *heads_gad = NULL;
     struct Gadget  *secs_gad  = NULL;
+    struct Gadget  *size_gad  = NULL;
     struct Window  *win       = NULL;
     BOOL            result    = FALSE;
     UWORD           warn_y    = 0;
     UWORD           warn_fh   = 8;
     char  cyls_str[12], heads_str[12], secs_str[12];
+    char  size_str[16];
 
     if (def_cyls  == 0) def_cyls  = 1;
     if (def_heads == 0) def_heads = 1;
@@ -850,6 +855,7 @@ BOOL geometry_dialog(ULONG def_cyls, ULONG def_heads, ULONG def_secs,
     sprintf(cyls_str,  "%lu", (unsigned long)def_cyls);
     sprintf(heads_str, "%lu", (unsigned long)def_heads);
     sprintf(secs_str,  "%lu", (unsigned long)def_secs);
+    size_str[0] = '\0';
 
     scr = LockPubScreen(NULL);
     if (!scr) goto geom_cleanup;
@@ -902,6 +908,35 @@ BOOL geometry_dialog(ULONG def_cyls, ULONG def_heads, ULONG def_secs,
             GSTR_GAD(GDLG_CYLS,  "Cylinders",   cyls_str,  &cyls_gad)
             GSTR_GAD(GDLG_HEADS, "Heads",        heads_str, &heads_gad)
             GSTR_GAD(GDLG_SECS,  "Sectors/Trk", secs_str,  &secs_gad)
+
+            /* Row 3: size field + Calc button (fills CHS with H=16 S=63) */
+            {
+                UWORD calc_w  = (UWORD)(font_h * 5 + 8);  /* ~48px at 8pt */
+                UWORD str_w   = gad_w - calc_w - pad;
+                WORD  row3_y  = GROW_Y(3);
+                { struct TagItem _gs[] = { {GTST_String,(ULONG)size_str},
+                                           {GTST_MaxChars,12}, {TAG_DONE,0} };
+                  ng.ng_LeftEdge  = (WORD)gad_x;
+                  ng.ng_TopEdge   = row3_y;
+                  ng.ng_Width     = (WORD)str_w;
+                  ng.ng_Height    = (WORD)row_h;
+                  ng.ng_GadgetText = "Size (e.g. 2G)";
+                  ng.ng_GadgetID  = GDLG_SIZE;
+                  ng.ng_Flags     = PLACETEXT_LEFT;
+                  size_gad = CreateGadgetA(STRING_KIND, prev, &ng, _gs);
+                  if (!size_gad) goto geom_cleanup;
+                  prev = size_gad; }
+                { struct TagItem _bt[] = { {TAG_DONE,0} };
+                  ng.ng_LeftEdge  = (WORD)(gad_x + str_w + pad);
+                  ng.ng_TopEdge   = row3_y;
+                  ng.ng_Width     = (WORD)calc_w;
+                  ng.ng_Height    = (WORD)row_h;
+                  ng.ng_GadgetText = "Calc";
+                  ng.ng_GadgetID  = GDLG_CALC;
+                  ng.ng_Flags     = PLACETEXT_IN;
+                  prev = CreateGadgetA(BUTTON_KIND, prev, &ng, _bt);
+                  if (!prev) goto geom_cleanup; }
+            }
 
 #undef GSTR_GAD
 #undef GROW_Y
@@ -994,6 +1029,39 @@ BOOL geometry_dialog(ULONG def_cyls, ULONG def_heads, ULONG def_secs,
                     case GDLG_CANCEL:
                         running = FALSE;
                         break;
+                    case GDLG_CALC: {
+                        /* Parse size string: digits + optional K/M/G suffix.
+                           No suffix = MB.  Fills CHS using standard H=16 S=63. */
+                        struct StringInfo *si_sz =
+                            (struct StringInfo *)size_gad->SpecialInfo;
+                        const char *p = (const char *)si_sz->Buffer;
+                        ULONG  val = 0;
+                        UQUAD  total_bytes;
+                        ULONG  new_cyls;
+                        ULONG  mult = 1024UL * 1024UL;   /* default: MB */
+                        while (*p >= '0' && *p <= '9')
+                            val = val * 10 + (ULONG)(*p++ - '0');
+                        if      (*p == 'G' || *p == 'g')
+                            mult = 1024UL * 1024UL * 1024UL;
+                        else if (*p == 'K' || *p == 'k')
+                            mult = 1024UL;
+                        total_bytes = (UQUAD)val * (UQUAD)mult;
+                        new_cyls = (ULONG)(total_bytes / (512ULL * 16ULL * 63ULL));
+                        if (new_cyls > 0) {
+                            struct TagItem st[2];
+                            st[1].ti_Tag = TAG_DONE; st[1].ti_Data = 0;
+                            sprintf(cyls_str,  "%lu", new_cyls);
+                            st[0].ti_Tag = GTST_String; st[0].ti_Data = (ULONG)cyls_str;
+                            GT_SetGadgetAttrsA(cyls_gad,  win, NULL, st);
+                            sprintf(heads_str, "16");
+                            st[0].ti_Data = (ULONG)heads_str;
+                            GT_SetGadgetAttrsA(heads_gad, win, NULL, st);
+                            sprintf(secs_str,  "63");
+                            st[0].ti_Data = (ULONG)secs_str;
+                            GT_SetGadgetAttrsA(secs_gad,  win, NULL, st);
+                        }
+                        break;
+                    }
                     }
                     break;
                 case IDCMP_REFRESHWINDOW:

@@ -38,7 +38,7 @@ ULONG parse_dostype(const char *s);
 
 void  partition_advanced_dialog(struct PartInfo *pi);
 BOOL  partition_dialog(struct PartInfo *pi, const char *title,
-                       const struct RDBInfo *rdb);
+                       const struct RDBInfo *rdb, BOOL is_new);
 
 void  show_about(struct Window *win);
 BOOL  geometry_dialog(ULONG def_cyls, ULONG def_heads, ULONG def_secs,
@@ -69,6 +69,11 @@ void  raw_hex_dump       (struct Window *win, struct BlockDev *bd);
 void  smart_status       (struct Window *win, struct BlockDev *bd);
 void  bad_block_scan     (struct Window *win, struct BlockDev *bd,
                           struct RDBInfo *rdb);
+void  rdb_integrity_check(struct Window *win, struct BlockDev *bd,
+                          const struct RDBInfo *rdb);
+void  rdb_verify_block   (struct Window *win, struct BlockDev *bd,
+                          const struct RDBInfo *rdb);
+void  rdb_verify_extended(struct Window *win, struct BlockDev *bd);
 
 /* ------------------------------------------------------------------ */
 /* partview_move.c                                                      */

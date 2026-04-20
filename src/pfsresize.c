@@ -373,25 +373,46 @@ BOOL PFS_GrowPartition(struct BlockDev *bd, const struct RDBInfo *rdb,
         }
 
         if (reserved_needed > reserved_free) {
+            /* Estimate the maximum safe high cylinder reachable with the
+               free reserved blocks that are actually available.  Conservative
+               (all reserved_free used for bitmaps, no index overhead), so the
+               real limit may be a cylinder or two lower. */
+            ULONG safe_new_bmb  = old_num_bmb + reserved_free;
+            ULONG safe_disksize = bitmapstart + safe_new_bmb * bm_coverage;
+            ULONG safe_cyls     = (bpc > 0) ? (safe_disksize / bpc) : 0;
+            ULONG safe_high     = (safe_cyls > 0)
+                                  ? (pi->low_cyl + safe_cyls - 1)
+                                  : old_high_cyl;
+            if (safe_high > pi->high_cyl) safe_high = pi->high_cyl;
             sprintf(err_buf,
-                    "PFS reserved area is too full to accommodate the grow.\n"
-                    "Need %lu free reserved blocks (%lu new bm + %lu new idx),\n"
-                    "but only %lu are available (lastreserved=%lu).\n"
-                    "Reformat with a larger reserved area to proceed.",
+                    "PFS reserved area too small for this grow.\n"
+                    "Need %lu new reserved blocks, only %lu free.\n\n"
+                    "Max safe target: cyl ~%lu "
+                    "(+%lu cyls instead of +%lu).\n\n"
+                    "To grow further, use PFSDoctor to\n"
+                    "expand the reserved area, then try again.",
                     (unsigned long)reserved_needed,
-                    (unsigned long)num_new_bmb,
-                    (unsigned long)num_new_idxb,
                     (unsigned long)reserved_free,
-                    (unsigned long)lastreserved);
+                    (unsigned long)safe_high,
+                    (unsigned long)(safe_high > old_high_cyl
+                                    ? safe_high - old_high_cyl : 0),
+                    (unsigned long)cyl_diff);
             goto done;
         }
 
         if (new_num_idxb > PFS_MAX_BITMAPINDEX) {
+            /* PFS3 rootblock holds at most 104 bitmap index pointers.
+               This is a hard limit of the PFS3 on-disk format. */
+            ULONG blksz      = (pi->block_size >= 512) ? pi->block_size : 512;
+            ULONG max_blocks = (ULONG)PFS_MAX_BITMAPINDEX * idxperblk
+                               * bm_coverage;
+            /* max_blocks in logical blocks → MB: divide by blocks-per-MB */
+            ULONG max_mb     = max_blocks / (1048576UL / blksz);
             sprintf(err_buf,
-                    "Partition too large: needs %lu bitmap index blocks "
-                    "(max %u).",
-                    (unsigned long)new_num_idxb,
-                    (unsigned)PFS_MAX_BITMAPINDEX);
+                    "Partition too large for PFS3.\n"
+                    "PFS3 supports at most ~%lu MB with this block size.\n"
+                    "Use a smaller high cylinder.",
+                    (unsigned long)max_mb);
             goto done;
         }
 

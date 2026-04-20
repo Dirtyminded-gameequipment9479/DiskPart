@@ -42,6 +42,7 @@ extern struct Library       *GadToolsBase;
 #define FSDLG_EDIT    4
 #define FSDLG_DELETE  5
 #define FSDLG_DONE    6
+#define FSDLG_CANCEL  7
 
 /* Gadget IDs for the add-FS sub-dialog */
 #define AFSDLG_DOSTYPE  1
@@ -504,21 +505,25 @@ BOOL filesystem_manager_dialog(struct RDBInfo *rdb)
           prev = lv_gad; }
 
         { UWORD btn_y    = bor_t + pad + hdr_h + lv_h + pad + sel_h + pad;
-          UWORD quarter  = (inner_w - pad * 2 - pad * 3) / 4;
+          /* 5 buttons: Add | Edit | Delete | Done | Cancel */
+          UWORD fifth    = (inner_w - pad * 2 - pad * 4) / 5;
           struct TagItem bt[] = {{TAG_DONE,0}};
           ng.ng_TopEdge=btn_y; ng.ng_Height=btn_h;
-          ng.ng_Width=quarter; ng.ng_Flags=PLACETEXT_IN;
+          ng.ng_Width=fifth; ng.ng_Flags=PLACETEXT_IN;
           ng.ng_LeftEdge=bor_l+pad; ng.ng_GadgetText="Add";
           ng.ng_GadgetID=FSDLG_ADD;
           prev=CreateGadgetA(BUTTON_KIND,prev,&ng,bt); if(!prev) goto fs_mgr_cleanup;
-          ng.ng_LeftEdge=bor_l+pad+quarter+pad; ng.ng_GadgetText="Edit";
+          ng.ng_LeftEdge=bor_l+pad+fifth+pad; ng.ng_GadgetText="Edit";
           ng.ng_GadgetID=FSDLG_EDIT;
           prev=CreateGadgetA(BUTTON_KIND,prev,&ng,bt); if(!prev) goto fs_mgr_cleanup;
-          ng.ng_LeftEdge=bor_l+pad+(quarter+pad)*2; ng.ng_GadgetText="Delete";
+          ng.ng_LeftEdge=bor_l+pad+(fifth+pad)*2; ng.ng_GadgetText="Delete";
           ng.ng_GadgetID=FSDLG_DELETE;
           prev=CreateGadgetA(BUTTON_KIND,prev,&ng,bt); if(!prev) goto fs_mgr_cleanup;
-          ng.ng_LeftEdge=bor_l+pad+(quarter+pad)*3; ng.ng_GadgetText="Done";
+          ng.ng_LeftEdge=bor_l+pad+(fifth+pad)*3; ng.ng_GadgetText="Done";
           ng.ng_GadgetID=FSDLG_DONE;
+          prev=CreateGadgetA(BUTTON_KIND,prev,&ng,bt); if(!prev) goto fs_mgr_cleanup;
+          ng.ng_LeftEdge=bor_l+pad+(fifth+pad)*4; ng.ng_GadgetText="Cancel";
+          ng.ng_GadgetID=FSDLG_CANCEL;
           prev=CreateGadgetA(BUTTON_KIND,prev,&ng,bt); if(!prev) goto fs_mgr_cleanup; }
 
         { struct TagItem wt[]={
@@ -554,6 +559,16 @@ BOOL filesystem_manager_dialog(struct RDBInfo *rdb)
 
     {
         BOOL running = TRUE;
+        UWORD orig_num_fs = rdb->num_fs;   /* for Cancel rollback */
+        /* Drain any events queued at the FS Manager window while a
+           sub-dialog was active.  Without this, clicks on the visible
+           background window (e.g. "Done") fire immediately after the
+           sub-dialog closes, skipping the user's next deliberate action. */
+#define FS_DRAIN_EVENTS() \
+    do { struct IntuiMessage *_dm; \
+         while ((_dm = GT_GetIMsg(win->UserPort)) != NULL) \
+             GT_ReplyIMsg(_dm); } while(0)
+
         while (running) {
             struct IntuiMessage *imsg;
             WaitPort(win->UserPort);
@@ -576,6 +591,19 @@ BOOL filesystem_manager_dialog(struct RDBInfo *rdb)
                         break; /* show-selected string gadget — ignore */
                     case FSDLG_DONE: running = FALSE; break;
 
+                    case FSDLG_CANCEL: {
+                        /* Discard entries added during this session.
+                           Edits and deletes cannot be undone here. */
+                        UWORD ci;
+                        for (ci = orig_num_fs; ci < rdb->num_fs; ci++)
+                            if (rdb->filesystems[ci].code)
+                                FreeVec(rdb->filesystems[ci].code);
+                        rdb->num_fs = orig_num_fs;
+                        dirty = FALSE;
+                        running = FALSE;
+                        break;
+                    }
+
                     case FSDLG_ADD:
                         if (rdb->num_fs < MAX_FILESYSTEMS) {
                             struct FSInfo new_fi;
@@ -595,6 +623,11 @@ BOOL filesystem_manager_dialog(struct RDBInfo *rdb)
                                   GT_SetGadgetAttrsA(lv_gad, win, NULL, rt); }
                                 sel = (WORD)(rdb->num_fs - 1);
                             }
+                            /* Discard any events that arrived at the background
+                               FS Manager window while the add sub-dialog was open.
+                               Prevents a "Done" click-through from closing the
+                               manager before the user sees the result. */
+                            FS_DRAIN_EVENTS();
                         }
                         break;
 
@@ -623,6 +656,7 @@ BOOL filesystem_manager_dialog(struct RDBInfo *rdb)
                                     edit_fi.code != rdb->filesystems[sel].code)
                                     FreeVec(edit_fi.code);
                             }
+                            FS_DRAIN_EVENTS();
                         }
                         break;
 
@@ -691,6 +725,7 @@ BOOL filesystem_manager_dialog(struct RDBInfo *rdb)
                                   build_fs_list(rdb);
                                   GT_SetGadgetAttrsA(lv_gad, win, NULL, rt); }
                             }
+                            FS_DRAIN_EVENTS();
                         }
                         break;
                     }
@@ -700,6 +735,7 @@ BOOL filesystem_manager_dialog(struct RDBInfo *rdb)
                 }
             }
         }
+#undef FS_DRAIN_EVENTS
     }
 
 fs_mgr_cleanup:

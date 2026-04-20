@@ -4,7 +4,7 @@
  * -nostdlib build: this replaces <string.h>, <stdio.h>, <stdlib.h>.
  *
  * strlen/memset/memcpy/memmove: support/gcc8_c_support.c
- * sprintf/strcmp/strncpy/strtoul/strtol: src/clib.c
+ * sprintf/snprintf/strcmp/strncpy/strtoul/strtol: src/clib.c
  */
 
 #ifndef CLIB_H
@@ -18,7 +18,8 @@ extern void  *memcpy(void *dst, const void *src, size_t n);
 extern void  *memmove(void *dst, const void *src, size_t n);
 extern int    memcmp (const void *a, const void *b, size_t n);
 
-int   sprintf(char *buf, const char *fmt, ...);
+int   sprintf (char *buf,             const char *fmt, ...);
+int   snprintf(char *buf, size_t size, const char *fmt, ...);
 int   strcmp(const char *a, const char *b);
 char *strncpy(char *dst, const char *src, size_t n);
 
