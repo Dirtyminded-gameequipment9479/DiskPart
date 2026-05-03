@@ -1,5 +1,0 @@
-{
-    "program": "out/DiskPart.exe",
-    "includePath": [ "${workspaceFolder}/src" ],
-    "defines": [ "NO_INLINE_STDARG" ]
-}
